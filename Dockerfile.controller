@@ -1,0 +1,19 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements-controller.txt .
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-controller.txt
+
+COPY config.yaml .
+COPY predictor/ ./predictor/
+COPY controller/ ./controller/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-c", "from controller.control_loop import ControlLoop; ControlLoop().run()"]

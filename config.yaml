@@ -1,0 +1,98 @@
+# =============================================================================
+# config.yaml — единый конфигурационный файл метода (глава 3, таблица 3.1)
+# Все параметры соответствуют описанию в главах 3 и 4 диссертации
+# =============================================================================
+
+# ── Метрики и временной ряд ───────────────────────────────────────────────
+timeseries:
+  dt_minutes: 5          # Δt = 5 мин (параграф 3.1)
+  period_p: 288          # p = 24*60/5 = 288 наблюдений/сутки (формула 3.9)
+  horizon_h: 3           # h = 3 шага = 15 мин (параграф 3.1, таблица 4.1)
+
+# ── Предобработка (параграф 3.2.1) ───────────────────────────────────────
+preprocessing:
+  w_a: 48                # окно обнаружения аномалий: 48 наблюдений = 4 часа
+  iqr_alpha: 1.5         # коэффициент α метода Тьюки (формула 3.8)
+  w_norm: 60             # окно нормализации: 60 наблюдений = 5 часов
+  stl_robust: true       # robust=True для STL (параграф 3.2.1)
+  n_cycles_seasonal: 7   # N_c = 7 суточных циклов для прогноза сезонности (форм. 3.12)
+  n_trend: 60            # n_T = 60 точек для линейной экстраполяции тренда (форм. 3.11)
+
+# ── Нейросетевая компонента GRU (таблица 4.2) ────────────────────────────
+model:
+  d_in: 69               # размерность входного вектора (60 + 6 + 3)
+  w_input: 60            # длина скользящего окна = 5 часов
+  gru_layers: 2
+  hidden_dim: 64
+  dropout: 0.10
+  quantiles: [0.025, 0.5, 0.975]  # три квантильных выхода (ε=0.05)
+  # Обучение
+  lr: 0.001
+  lr_decay: 0.99
+  grad_clip: 1.0
+  max_epochs: 100
+  patience: 10           # ранняя остановка
+  batch_size: 32
+  # Дообучение
+  retrain_every: 60      # каждые 60 итераций = 5 часов (параграф 3.2.2)
+  retrain_window: 2016   # 7 суток = 2016 наблюдений (параграф 3.2.2)
+
+# ── Принятие решений (параграф 3.2.3) ────────────────────────────────────
+decision:
+  cpu_target: 0.70       # целевая утилизация (формула 3.7)
+  epsilon: 0.05          # допустимая доля нарушений SLA (формула 3.5)
+  r_min: 2               # минимальное число реплик
+  r_max_cluster: 20       # максимум по ёмкости кластера (таблица 4.1)
+  tau: 4                 # τ = 4 шага подтверждения для масштабирования вниз (форм. 3.16)
+  beta: 0.3              # β = 0.3 коэффициент адаптивного порога (формула 3.17)
+  # Ограничение СУБД (формула 3.3)
+  db:
+    max_conn: 300
+    conn_reserve: 20
+    pool_size: 5
+
+# ── Kubernetes ───────────────────────────────────────────────────────────
+kubernetes:
+  namespace: "default"
+  deployment_name: "webapp"
+  in_cluster: false      # false при запуске вне кластера (локально)
+
+# ── Prometheus ───────────────────────────────────────────────────────────
+prometheus:
+  url: "http://localhost:9090"
+  scrape_interval_sec: 5
+  # PromQL-запросы для каждой метрики
+  queries:
+    cpu: >
+      sum(rate(container_cpu_usage_seconds_total{namespace="default",
+      pod=~"webapp-.*"}[5m])) /
+      sum(kube_pod_container_resource_limits{namespace="default",
+      resource="cpu", pod=~"webapp-.*"})
+    mem: >
+      sum(container_memory_working_set_bytes{namespace="default",
+      pod=~"webapp-.*"}) /
+      sum(kube_pod_container_resource_limits{namespace="default",
+      resource="memory", pod=~"webapp-.*"})
+    rps: >
+      sum(rate(http_requests_total{namespace="default",
+      pod=~"webapp-.*"}[5m]))
+    lat_p95: >
+      histogram_quantile(0.95, sum(rate(
+      http_request_duration_seconds_bucket{namespace="default",
+      pod=~"webapp-.*"}[5m])) by (le)) * 1000
+    err_rate: >
+      sum(rate(http_requests_total{namespace="default",
+      pod=~"webapp-.*",status=~"5.."}[5m])) /
+      sum(rate(http_requests_total{namespace="default",
+      pod=~"webapp-.*"}[5m]))
+    class_counts: >
+      sum by (class_id) (rate(http_requests_total{namespace="default",
+      pod=~"webapp-.*"}[5m]))
+
+# ── Flask веб-приложение ─────────────────────────────────────────────────
+webapp:
+  host: "0.0.0.0"
+  port: 5000
+  database_url: "postgresql://appuser:apppass@localhost:5433/appdb"
+  sqlalchemy_pool_size: 5
+  sqlalchemy_max_overflow: 0

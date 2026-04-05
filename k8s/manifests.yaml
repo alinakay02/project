@@ -1,0 +1,409 @@
+# =============================================================================
+# k8s/manifests.yaml — Все ресурсы Kubernetes для экспериментального стенда
+# Развёртывается командой: kubectl apply -f k8s/manifests.yaml
+# =============================================================================
+
+---
+# Пространство имён
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: default
+
+---
+# ServiceAccount для контроллера (аутентификация kubernetes-python)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-sa
+  namespace: default
+
+---
+# ClusterRole: права на чтение подов и масштабирование Deployment
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: controller-role
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/metrics"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: controller-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: controller-role
+subjects:
+  - kind: ServiceAccount
+    name: controller-sa
+    namespace: default
+
+---
+# PostgreSQL — PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+
+---
+# PostgreSQL — Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          args: ["-c", "max_connections=300"]
+          env:
+            - name: POSTGRES_USER
+              value: appuser
+            - name: POSTGRES_PASSWORD
+              value: apppass
+            - name: POSTGRES_DB
+              value: appdb
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "appuser", "-d", "appdb"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+
+---
+# PostgreSQL — Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+# Webapp — Deployment
+# cpu_lim=1000m, mem_lim=1Gi (высокая нагрузка 5000-12000)
+# r_min=2, r_max=20 (таблица 4.1)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: default
+spec:
+  replicas: 4          # r_min = 2
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "5000"
+    spec:
+      containers:
+        - name: webapp
+          image: webapp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"       # cpu_lim = 500m (таблица 4.1)
+              memory: "1Gi"   # mem_lim = 512 MiB
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          env:
+            - name: PYTHONPATH
+              value: "/app"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: app-config
+
+---
+# Webapp — Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp
+  namespace: default
+spec:
+  selector:
+    app: webapp
+  ports:
+    - port: 80
+      targetPort: 5000
+  type: ClusterIP
+
+---
+# Controller (прогностический сервис) — Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: controller
+  template:
+    metadata:
+      labels:
+        app: controller
+    spec:
+      serviceAccountName: controller-sa
+      containers:
+        - name: controller
+          image: controller:latest
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: app-config
+
+---
+# ConfigMap с config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+data:
+  config.yaml: |
+    timeseries:
+      dt_minutes: 5
+      period_p: 288
+      horizon_h: 3
+    preprocessing:
+      w_a: 48
+      iqr_alpha: 1.5
+      w_norm: 60
+      stl_robust: true
+      n_cycles_seasonal: 7
+      n_trend: 60
+    model:
+      d_in: 69
+      w_input: 60
+      gru_layers: 2
+      hidden_dim: 64
+      dropout: 0.10
+      quantiles: [0.025, 0.5, 0.975]
+      lr: 0.001
+      lr_decay: 0.99
+      grad_clip: 1.0
+      max_epochs: 100
+      patience: 10
+      batch_size: 32
+      retrain_every: 60
+      retrain_window: 2016
+    decision:
+      cpu_target: 0.70
+      epsilon: 0.05
+      r_min: 2
+      r_max_cluster: 20
+      tau: 4
+      beta: 0.3
+      db:
+        max_conn: 300
+        conn_reserve: 20
+        pool_size: 5
+    kubernetes:
+      namespace: "default"
+      deployment_name: "webapp"
+      in_cluster: true
+    prometheus:
+      url: "http://prometheus:9090"
+      scrape_interval_sec: 5
+      queries:
+        cpu: >
+          sum(rate(container_cpu_usage_seconds_total{namespace="default",
+          pod=~"webapp-.*"}[5m])) /
+          sum(kube_pod_container_resource_limits{namespace="default",
+          resource="cpu", pod=~"webapp-.*"})
+        mem: >
+          sum(container_memory_working_set_bytes{namespace="default",
+          pod=~"webapp-.*"}) /
+          sum(kube_pod_container_resource_limits{namespace="default",
+          resource="memory", pod=~"webapp-.*"})
+        rps: >
+          sum(rate(http_requests_total{namespace="default",
+          pod=~"webapp-.*"}[5m]))
+        lat_p95: >
+          histogram_quantile(0.95, sum(rate(
+          http_request_duration_seconds_bucket{namespace="default",
+          pod=~"webapp-.*"}[5m])) by (le)) * 1000
+        err_rate: >
+          sum(rate(http_requests_total{namespace="default",
+          pod=~"webapp-.*",status=~"5.."}[5m])) /
+          sum(rate(http_requests_total{namespace="default",
+          pod=~"webapp-.*"}[5m]))
+        class_counts: >
+          sum by (class_id) (rate(http_requests_total{namespace="default",
+          pod=~"webapp-.*"}[5m]))
+    webapp:
+      host: "0.0.0.0"
+      port: 5000
+      database_url: "postgresql://appuser:apppass@postgres:5432/appdb"
+      sqlalchemy_pool_size: 5
+      sqlalchemy_max_overflow: 0
+
+---
+# Prometheus — ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: default
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      - job_name: 'webapp'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ['default']
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            target_label: __metrics_path__
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+      - job_name: 'cadvisor'
+        kubernetes_sd_configs:
+          - role: node
+        metrics_path: /metrics/cadvisor
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+---
+# Prometheus — Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: controller-sa
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.47.0
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+          resources:
+            requests: {cpu: "100m", memory: "256Mi"}
+            limits:   {cpu: "500m", memory: "1Gi"}
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: default
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090

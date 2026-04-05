@@ -1,0 +1,23 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements-webapp.txt .
+RUN pip install --no-cache-dir -r requirements-webapp.txt
+
+COPY config.yaml .
+COPY app/ ./app/
+COPY predictor/ ./predictor/
+COPY controller/ ./controller/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 5000 5001
+
+# Запускаем оба сервера параллельно
+CMD ["sh", "-c", "python app/main.py & python app/api.py"]
