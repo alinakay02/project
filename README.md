@@ -435,3 +435,6 @@ python -m pytest tests/test_experiments.py -v -s \
 | Тест Alibaba пропускается | Датасет не скачан | Выполнить Шаг 10 |
 | Медленное обучение в тестах | CPU медленный | В `config.yaml` установить `max_epochs: 20` для отладки |
 | `SARIMA fit failed` в логах | Нормальная ситуация | Используется автоматический fallback-прогноз |
+
+Datasets:
+Fernández-Montes, A. DataCenter-Traces-Datasets / A. Fernández-Montes, D. Fernández Cerero. — 2024. — DOI: 10.5281/zenodo.14564935. — URL: https://zenodo.org/records/14564935 (дата обращения: 06.04.2026).

@@ -38,5 +38,6 @@ results/
 Thumbs.db
 .DS_Store
 
-# Claude
+models/
+writing/
 .claude/

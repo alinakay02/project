@@ -99,6 +99,7 @@ class HybridForecaster:
         timestamps: np.ndarray,     # unix-метки времени
         phi: np.ndarray,            # (3, n) — состав классов
         val_split: float = 0.15,
+        epoch_callback=None,
     ) -> None:
         """Полный цикл обучения: предобработка → создание датасета → GRU.fit()."""
         logger.info(f"Starting fit on {len(cpu_series)} observations.")
@@ -129,7 +130,7 @@ class HybridForecaster:
             w_input=self.w_input,
         )
 
-        self.trainer.fit(train_ds, val_ds)
+        self.trainer.fit(train_ds, val_ds, epoch_callback=epoch_callback)
         self._is_trained = True
         logger.info(
             f"Fit complete. Stopped at epoch {self.trainer.stopped_epoch or 'max'}. "
@@ -277,33 +278,30 @@ class HybridForecaster:
         phi: np.ndarray,
     ) -> np.ndarray:
         """
-        Формирует входной вектор d_in=69 для GRU (параграф 3.2.2):
-          60 значений нормализованного остатка
-          6 тригонометрических временных признаков (последнего шага)
-          3 значения φ_t
+        Формирует входную последовательность (w_input, 7) для GRU:
+          Каждый шаг: [R̃_t, sin_h, cos_h, sin_d, cos_d, sin_m, cos_m]
         """
-        # Последние w_input значений остатка
-        r_window = resid_norm[-self.w_input:]
-        if len(r_window) < self.w_input:
-            pad = np.zeros(self.w_input - len(r_window))
-            r_window = np.concatenate([pad, r_window])
+        w = self.w_input
+        r_window = resid_norm[-w:]
+        ts_window = timestamps[-w:]
 
-        # Временные признаки последней точки
-        ts = timestamps[-1]
-        hour = (ts % 86400) / 3600.0
-        dow = (ts // 86400) % 7
-        minute = (ts % 3600) / 60.0
-        time_feats = np.array([
-            math.sin(2 * math.pi * hour / 24),
-            math.cos(2 * math.pi * hour / 24),
-            math.sin(2 * math.pi * dow / 7),
-            math.cos(2 * math.pi * dow / 7),
-            math.sin(2 * math.pi * minute / 60),
-            math.cos(2 * math.pi * minute / 60),
-        ])
+        if len(r_window) < w:
+            pad_n = w - len(r_window)
+            r_window = np.concatenate([np.zeros(pad_n), r_window])
+            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
 
-        # Признаки состава классов (последнее значение)
-        phi_last = phi[:, -1]  # (3,)
+        hours = (ts_window % 86400) / 3600.0
+        dows = ((ts_window // 86400) % 7).astype(float)
+        minutes = ((ts_window % 3600) / 60.0)
 
-        X = np.concatenate([r_window, time_feats, phi_last]).reshape(1, -1)  # (1, 69)
-        return X
+        X = np.stack([
+            r_window,
+            np.sin(2 * math.pi * hours / 24),
+            np.cos(2 * math.pi * hours / 24),
+            np.sin(2 * math.pi * dows / 7),
+            np.cos(2 * math.pi * dows / 7),
+            np.sin(2 * math.pi * minutes / 60),
+            np.cos(2 * math.pi * minutes / 60),
+        ], axis=1)  # (w, 7)
+
+        return X.reshape(1, w, 7)

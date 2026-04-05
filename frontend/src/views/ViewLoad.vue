@@ -79,6 +79,13 @@
           </div>
         </div>
 
+        <!-- Сценарии -->
+        <div class="btn-row-presets mt-4">
+          <button class="btn btn-ghost" @click="setPreset('compute')">Сценарий: Класс 1</button>
+          <button class="btn btn-ghost" @click="setPreset('db')">Сценарий: Класс 2</button>
+          <button class="btn btn-ghost" @click="setPreset('memory')">Сценарий: Класс 3</button>
+          <button class="btn btn-ghost" @click="setPreset('mixed')">Смешанный</button>
+        </div>
         <!-- Кнопки запуска -->
         <div class="btn-row mt-4">
           <button class="btn btn-success" :disabled="!canStart" @click="startLoad">
@@ -87,10 +94,6 @@
           <button class="btn btn-danger" :disabled="!isRunning" @click="stopLoad">
             Остановить
           </button>
-          <button class="btn btn-ghost" @click="setPreset('compute')">Сценарий: Класс 1</button>
-          <button class="btn btn-ghost" @click="setPreset('db')">Сценарий: Класс 2</button>
-          <button class="btn btn-ghost" @click="setPreset('memory')">Сценарий: Класс 3</button>
-          <button class="btn btn-ghost" @click="setPreset('mixed')">Смешанный</button>
         </div>
       </div>
 
@@ -295,7 +298,8 @@ onUnmounted(() => clearInterval(metricsTimer))
 .slider-row  { display: flex; flex-direction: column; gap: 6px }
 .slider-marks { display: flex; justify-content: space-between; font-size: 10px; color: #a0aec0 }
 
-.btn-row { display: flex; gap: 8px; flex-wrap: wrap }
+.btn-row-presets { display: flex; gap: 8px }
+.btn-row { display: flex; gap: 8px }
 
 .status-block { display: flex; align-items: center; gap: 10px; padding: 12px;
                 border-radius: 8px; font-size: 14px; font-weight: 600 }

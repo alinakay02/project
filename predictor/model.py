@@ -50,51 +50,62 @@ class QuantileLoss(nn.Module):
 class GRUQuantileNet(nn.Module):
     """
     Архитектура (таблица 4.2):
-      Входной слой: d_in = 69
-        - 60 значений нормализованного остатка R̃_t
+      Вход: последовательность из w_input=60 шагов, каждый с d_step=10 признаками:
+        - 1 значение нормализованного остатка R̃_t
         - 6 тригонометрических временных признаков (sin/cos час, день, минута)
         - 3 признака состава классов φ_t
       GRU слой 1: 64 нейрона
-      Dropout: p = 0.10
+      Dropout: p = 0.25
       GRU слой 2: 64 нейрона
-      Полносвязный выход: 3 квантиля (0.025, 0.5, 0.975)
+      Dropout: p = 0.25
+      Полносвязный слой: 32 нейрона + ReLU
+      Выходной слой: 3 квантиля (0.025, 0.5, 0.975)
+
+    Параметр d_in сохранён для обратной совместимости API.
     """
     def __init__(
         self,
         d_in: int = 69,
         hidden_dim: int = 64,
         n_layers: int = 2,
-        dropout: float = 0.10,
+        dropout: float = 0.25,
         n_quantiles: int = 3,
     ):
         super().__init__()
         self.d_in = d_in
+        self.d_step = 7          # признаков на один временной шаг: residual + 6 time
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
 
-        # Два рекуррентных слоя GRU (с dropout между ними)
-        self.gru1 = nn.GRU(
-            input_size=d_in, hidden_size=hidden_dim,
-            num_layers=1, batch_first=True
+        # Два рекуррентных слоя GRU с dropout между ними
+        self.gru = nn.GRU(
+            input_size=self.d_step, hidden_size=hidden_dim,
+            num_layers=n_layers, batch_first=True,
+            dropout=dropout if n_layers > 1 else 0,
         )
         self.dropout = nn.Dropout(p=dropout)
-        self.gru2 = nn.GRU(
-            input_size=hidden_dim, hidden_size=hidden_dim,
-            num_layers=1, batch_first=True
+        # Полносвязная голова с промежуточным слоем
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(32, n_quantiles),
         )
-        # Выходной полносвязный слой → 3 квантиля
-        self.fc = nn.Linear(hidden_dim, n_quantiles)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (batch, seq_len=60, d_in=69) — если d_in=1, то seq задаётся иначе
-        Для нашей задачи: x имеет форму (batch, 1, d_in=69) — один шаг
+        x: (batch, seq_len, d_step=10) — последовательность временных шагов
+           или (batch, 1, d_in=69) — legacy формат (авто-конвертируется)
         """
-        out1, _ = self.gru1(x)           # (batch, seq, hidden)
-        out1 = self.dropout(out1)
-        out2, _ = self.gru2(out1)        # (batch, seq, hidden)
-        last = out2[:, -1, :]            # берём последний временной шаг
-        return self.fc(last)             # (batch, 3)
+        # Обратная совместимость: если пришёл legacy вектор (1, d_in), разворачиваем
+        if x.ndim == 3 and x.shape[1] == 1 and x.shape[2] > self.d_step:
+            r = x[:, 0, :60]                          # (batch, 60)
+            feats = x[:, 0, 60:66].unsqueeze(1).expand(-1, 60, -1)  # (batch, 60, 6)
+            x = torch.cat([r.unsqueeze(-1), feats], dim=-1)         # (batch, 60, 7)
+
+        out, _ = self.gru(x)                 # (batch, seq, hidden)
+        last = self.dropout(out[:, -1, :])   # (batch, hidden)
+        return self.head(last)               # (batch, n_quantiles)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,19 +116,19 @@ class TimeSeriesDataset(Dataset):
     """
     Скользящее окно длиной w_input для обучения GRU.
     Каждый пример: (X, y), где
-      X — окно из w_input временных шагов с признаками (d_in=69)
+      X — последовательность из w_input шагов, каждый с 7 признаками:
+          [R̃_t, sin_h, cos_h, sin_d, cos_d, sin_m, cos_m]
       y — следующее значение нормализованного остатка
     """
     def __init__(
         self,
         residual_norm: np.ndarray,   # R̃_t (нормализованный остаток)
         timestamps: np.ndarray,      # unix timestamps для временных признаков
-        phi: np.ndarray,             # φ_t (3, n) — состав классов
+        phi: np.ndarray,             # φ_t (3, n) — сохранён для совместимости, не используется
         w_input: int = 60,
     ):
         self.residual = residual_norm.astype(np.float32)
         self.timestamps = timestamps
-        self.phi = phi.astype(np.float32)  # (3, n)
         self.w = w_input
         self.n = len(residual_norm) - w_input
 
@@ -125,14 +136,13 @@ class TimeSeriesDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        window_r = self.residual[idx: idx + self.w]   # (w,)
+        window_r = self.residual[idx: idx + self.w]     # (w,)
         window_ts = self.timestamps[idx: idx + self.w]
-        window_phi = self.phi[:, idx: idx + self.w].T  # (w, 3)
 
-        # Тригонометрические временные признаки (6 значений на шаг)
-        hours = (window_ts % 86400) / 3600.0       # час суток [0,24)
-        dows = ((window_ts // 86400) % 7).astype(float)  # день недели [0,7)
-        minutes = ((window_ts % 3600) / 60.0)       # минута часа [0,60)
+        # Тригонометрические временные признаки для каждого шага окна
+        hours = (window_ts % 86400) / 3600.0
+        dows = ((window_ts // 86400) % 7).astype(float)
+        minutes = ((window_ts % 3600) / 60.0)
 
         sin_h = np.sin(2 * np.pi * hours / 24).reshape(-1, 1)
         cos_h = np.cos(2 * np.pi * hours / 24).reshape(-1, 1)
@@ -141,19 +151,13 @@ class TimeSeriesDataset(Dataset):
         sin_m = np.sin(2 * np.pi * minutes / 60).reshape(-1, 1)
         cos_m = np.cos(2 * np.pi * minutes / 60).reshape(-1, 1)
 
-        # Собираем вектор признаков: (w, 60+6+3 = 69)
-        # Но архитектура принимает ОДИН шаг как весь вектор → (1, 69)
-        # Здесь используем скользящее окно как одну «точку» с 60 историческими + 6 + 3
-        residual_block = window_r.reshape(1, -1)        # (1, 60)
-        time_feats = np.concatenate(
-            [sin_h[-1:], cos_h[-1:], sin_d[-1:], cos_d[-1:], sin_m[-1:], cos_m[-1:]],
-            axis=1
-        )  # (1, 6) — временные признаки ПОСЛЕДНЕЙ точки окна
-        phi_block = window_phi[-1:, :]  # (1, 3)
+        # (w, 7): residual + 6 time features
+        X = np.concatenate([
+            window_r.reshape(-1, 1),
+            sin_h, cos_h, sin_d, cos_d, sin_m, cos_m,
+        ], axis=1)  # (w, 7)
 
-        X = np.concatenate([residual_block, time_feats, phi_block], axis=1)  # (1, 69)
         y = self.residual[idx + self.w]
-
         return torch.FloatTensor(X), torch.FloatTensor([y])
 
 
@@ -195,7 +199,7 @@ class GRUTrainer:
         self.model.to(self.device)
 
         self.criterion = QuantileLoss(self.quantiles)
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizer, gamma=lr_decay
         )
@@ -211,6 +215,7 @@ class GRUTrainer:
         self,
         train_dataset: TimeSeriesDataset,
         val_dataset: TimeSeriesDataset,
+        epoch_callback=None,
     ) -> None:
         """
         Обучение с ранней остановкой (patience=10 эпох).
@@ -268,7 +273,10 @@ class GRUTrainer:
                 f"val_loss={val_loss:.4f} | no_improve={self.epochs_no_improve}"
             )
 
-            if self.epochs_no_improve >= self.patience:
+            if epoch_callback:
+                epoch_callback(epoch, train_loss, val_loss, self.best_val_loss)
+
+            if self.patience and self.epochs_no_improve >= self.patience:
                 self.stopped_epoch = epoch
                 logger.info(f"Early stopping at epoch {epoch}.")
                 break

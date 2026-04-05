@@ -19,17 +19,10 @@ OUT = os.path.join(ROOT, "results", "experiments_output.txt")
 os.makedirs(os.path.join(ROOT, "results"), exist_ok=True)
 
 TESTS = [
-    # ── Разработанный метод ──
-    "TestComputationTime",
-    "TestHorizonDependence",
-    "TestMixedLoadScenario",
-    "TestAblation",
-    "TestSpikeResilience",
-    "TestRetrainingEffect",
-    # ── Сравнение с базовыми методами ──
-    "TestForecastAccuracyAlibaba",   # Proposed vs GRU (Alibaba)
-    "TestForecastAllDatasets",        # Proposed vs SARIMA (4 синтетических)
-    "TestManagementEfficiency",       # SLA, утилизация, ops — Proposed vs HPA
+    "TestCompareAlibaba",       # 9 методов на Alibaba (основной)
+    "TestCompareAllDatasets",    # 9 методов на Google, Azure, синтетических
+    "TestHorizonDependence",    # MAE при h=1,2,3,4,6
+    "TestComputationTime",      # Время итерации
 ]
 
 env = dict(os.environ)
@@ -38,9 +31,8 @@ env["PYTHONUTF8"] = "1"
 env["PYTHONUNBUFFERED"] = "1"
 
 COMPARE_TESTS = [
-    "TestForecastAccuracyAlibaba",
-    "TestForecastAllDatasets",
-    "TestManagementEfficiency",
+    "TestCompareAlibaba",
+    "TestCompareAllDatasets",
 ]
 
 if args.only_compare:

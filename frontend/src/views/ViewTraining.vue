@@ -1,10 +1,7 @@
 <template>
   <div>
     <div class="page-header">
-      <h2 class="page-title">Обучение нейросетевой модели</h2>
-      <p class="page-desc">
-        Визуализация процесса обучения GRU-компоненты гибридного прогнозировщика.
-      </p>
+      <h2 class="page-title">Обучение модели</h2>
     </div>
 
     <div class="grid-2 mt-4">
@@ -40,12 +37,7 @@
           </div>
           <div v-if="!training.running && training.epoch > 0" class="result-box mt-4">
             <span class="badge badge-green">Обучение завершено</span>
-            на эпохе {{ training.epoch }}
-            <span v-if="training.stopped_early"> (ранняя остановка, patience = {{ training.patience }})</span>
-            <span v-else> (все {{ maxEpochs }} эпох)</span>
-            <div class="mt-8" style="font-size:12px;color:#718096">
-              Итоговый val_loss = {{ training.best_val?.toFixed(4) || '—' }}
-            </div>
+            val_loss = {{ training.best_val?.toFixed(4) || '—' }}
           </div>
         </div>
       </div>
@@ -68,11 +60,27 @@
         </div>
       </div>
     </div>
+
+    <!-- ── Предпросмотр датасета ──────────────────────────────────────── -->
+    <div class="mt-4">
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between">
+          <span>Данные для обучения</span>
+          <span v-if="previewTotal > 0" class="badge badge-blue">{{ previewTotal }} точек</span>
+        </div>
+        <div v-if="previewCpu.length === 0" class="empty-chart">
+          Выберите датасет, чтобы увидеть данные
+        </div>
+        <div v-else class="chart-wrap">
+          <LineChart :data="previewChartData" :options="previewOptions" />
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import { Chart as ChartJS, CategoryScale, LinearScale,
          PointElement, LineElement, Tooltip, Legend } from 'chart.js'
@@ -83,6 +91,9 @@ const training = ref({ running:false, epoch:0, train_loss:[], val_loss:[], best_
                        max_epochs: 100, patience: 10, stopped_early: false })
 const datasets = ref([])
 const selectedDataset = ref('mixed')
+const previewCpu = ref([])
+const previewTs  = ref([])
+const previewTotal = ref(0)
 
 const maxEpochs = computed(() => training.value.max_epochs || 100)
 const epochPct = computed(() => (training.value.epoch / maxEpochs.value) * 100)
@@ -116,6 +127,44 @@ const lossOptions = {
   plugins: { legend: { labels: { color: '#4a5568', font: { size: 11 } } } }
 }
 
+// ── Предпросмотр датасета ──────────────────────────────────────────
+async function fetchPreview() {
+  try {
+    const { data } = await axios.get(`/api/datasets/preview?dataset=${selectedDataset.value}&n=500`)
+    previewCpu.value = data.cpu || []
+    previewTs.value = data.timestamps || []
+    previewTotal.value = data.total_points || 0
+  } catch {}
+}
+
+watch(selectedDataset, fetchPreview)
+
+const fmtTime = ts => {
+  const d = new Date(ts * 1000)
+  return d.toLocaleDateString('ru-RU', { day:'2-digit', month:'2-digit' }) + ' ' +
+         d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0')
+}
+
+const previewChartData = computed(() => ({
+  labels: previewTs.value.map((ts, i) => i % Math.max(1, Math.floor(previewTs.value.length / 12)) === 0 ? fmtTime(ts) : ''),
+  datasets: [{
+    label: 'CPU утилизация',
+    data: previewCpu.value.map(v => +(v * 100).toFixed(1)),
+    borderColor: '#3182ce', borderWidth: 1.5,
+    pointRadius: 0, fill: false, tension: .2,
+  }]
+}))
+
+const previewOptions = {
+  responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+  scales: {
+    x: { ticks: { color: '#4a5568', maxTicksLimit: 12, maxRotation: 45 }, grid: { color: '#edf2f7' } },
+    y: { ticks: { color: '#4a5568', callback: v => v+'%' }, grid: { color: '#edf2f7' },
+         min: 0, max: 100 }
+  },
+  plugins: { legend: { display: false } }
+}
+
 async function startTraining() {
   try {
     await axios.post('/api/training/start', { dataset: selectedDataset.value })
@@ -136,6 +185,7 @@ onMounted(async () => {
     datasets.value = data.datasets
   } catch {}
   pollTraining()
+  fetchPreview()
   timer = setInterval(pollTraining, 1000)
 })
 onUnmounted(() => clearInterval(timer))

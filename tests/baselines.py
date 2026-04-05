@@ -60,48 +60,298 @@ class SARIMAForecaster(BaseForecaster):
             return fallback, fallback*0.8, fallback*1.2
 
 
-class ProphetForecaster(BaseForecaster):
-    """Prophet с параметрами по умолчанию для суточных рядов."""
+class ARIMAForecaster(BaseForecaster):
+    """ARIMA(p,d,q) без сезонной компоненты."""
 
-    def __init__(self, horizon_h=3, dt_minutes=5):
+    def __init__(self, horizon_h=3, **kwargs):
         self.horizon_h = horizon_h
-        self.dt_minutes = dt_minutes
-        self._model = None
+        self._model_fit = None
 
     def fit(self, cpu, ts, phi):
         try:
-            from prophet import Prophet
-            import pandas as pd
-            df = pd.DataFrame({"ds": pd.to_datetime(ts, unit="s"), "y": cpu})
-            self._model = Prophet(
-                daily_seasonality=True,
-                weekly_seasonality=True,
-                yearly_seasonality=False,
-                changepoint_prior_scale=0.05,
-            )
-            self._model.fit(df)
-            self._ts_last = int(ts[-1])
+            from statsmodels.tsa.arima.model import ARIMA
+            model = ARIMA(cpu, order=(2, 1, 2))
+            self._model_fit = model.fit(method_kwargs={"maxiter": 200})
         except Exception as e:
-            logger.warning(f"Prophet fit failed: {e}")
-            self._model = None
+            logger.warning(f"ARIMA fit failed: {e}")
+            self._model_fit = None
+
+    def predict(self, cpu, ts, phi):
+        if self._model_fit is None:
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-60:])))
+            return fb, fb * 0.8, fb * 1.2
+        try:
+            from statsmodels.tsa.arima.model import ARIMA
+            model = ARIMA(cpu, order=(2, 1, 2))
+            fit = model.filter(self._model_fit.params)
+            fc = fit.forecast(self.horizon_h)
+            fc = np.clip(fc, 0, 1)
+            std_est = float(np.std(cpu[-288:])) * 1.5
+            return fc, np.clip(fc - 1.96 * std_est, 0, 1), np.clip(fc + 1.96 * std_est, 0, 1)
+        except Exception:
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
+            return fb, fb * 0.8, fb * 1.2
+
+
+class HoltWintersForecaster(BaseForecaster):
+    """Экспоненциальное сглаживание Хольта-Винтерса с суточной сезонностью."""
+
+    def __init__(self, horizon_h=3, period=288, **kwargs):
+        self.horizon_h = horizon_h
+        self.period = period
+        self._model_fit = None
+
+    def fit(self, cpu, ts, phi):
+        try:
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            model = ExponentialSmoothing(
+                cpu, trend="add", seasonal="add",
+                seasonal_periods=self.period,
+                initialization_method="estimated",
+            )
+            self._model_fit = model.fit(optimized=True, use_brute=False)
+        except Exception as e:
+            logger.warning(f"Holt-Winters fit failed: {e}")
+            self._model_fit = None
+
+    def predict(self, cpu, ts, phi):
+        if self._model_fit is None:
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-60:])))
+            return fb, fb * 0.8, fb * 1.2
+        try:
+            fc = self._model_fit.forecast(self.horizon_h)
+            fc = np.clip(fc, 0, 1)
+            std_est = float(np.std(cpu[-288:])) * 1.5
+            return fc, np.clip(fc - 1.96 * std_est, 0, 1), np.clip(fc + 1.96 * std_est, 0, 1)
+        except Exception:
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
+            return fb, fb * 0.8, fb * 1.2
+
+
+class RandomForestForecaster(BaseForecaster):
+    """Случайный лес: вход — окно из w последних значений + календарные признаки."""
+
+    def __init__(self, horizon_h=3, w_input=60, n_estimators=100, **kwargs):
+        self.horizon_h = horizon_h
+        self.w = w_input
+        self.n_estimators = n_estimators
+        self._model = None
+
+    def _build_features(self, cpu, ts, start, end):
+        """Строит матрицу признаков для обучения/предсказания."""
+        X, y = [], []
+        for i in range(start, end):
+            window = cpu[i - self.w:i]
+            t = ts[i]
+            hour = (t % 86400) / 3600.0
+            dow = (t // 86400) % 7
+            feats = np.concatenate([window, [
+                np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24),
+                np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7),
+            ]])
+            X.append(feats)
+            y.append(cpu[i])
+        return np.array(X), np.array(y)
+
+    def fit(self, cpu, ts, phi):
+        try:
+            from sklearn.ensemble import RandomForestRegressor
+            X, y = self._build_features(cpu, ts, self.w, len(cpu))
+            self._model = RandomForestRegressor(
+                n_estimators=self.n_estimators, max_depth=12, random_state=42, n_jobs=-1)
+            self._model.fit(X, y)
+            self._cpu_train = cpu
+            self._ts_train = ts
+        except Exception as e:
+            logger.warning(f"RandomForest fit failed: {e}")
 
     def predict(self, cpu, ts, phi):
         if self._model is None:
-            fallback = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
-            return fallback, fallback*0.8, fallback*1.2
-        try:
-            import pandas as pd
-            last_ts = int(ts[-1])
-            future_ts = [last_ts + (k+1)*self.dt_minutes*60 for k in range(self.horizon_h)]
-            df_future = pd.DataFrame({"ds": pd.to_datetime(future_ts, unit="s")})
-            fc_df = self._model.predict(df_future)
-            y = fc_df["yhat"].values
-            lo = fc_df["yhat_lower"].values
-            hi = fc_df["yhat_upper"].values
-            return np.clip(y, 0, 1), np.clip(lo, 0, 1), np.clip(hi, 0, 1)
-        except Exception:
-            fallback = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
-            return fallback, fallback*0.8, fallback*1.2
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-60:])))
+            return fb, fb * 0.8, fb * 1.2
+        preds = []
+        current = cpu.copy()
+        for k in range(self.horizon_h):
+            window = current[-self.w:]
+            t = ts[-1] + (k + 1) * 300
+            hour = (t % 86400) / 3600.0
+            dow = (t // 86400) % 7
+            feats = np.concatenate([window, [
+                np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24),
+                np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7),
+            ]]).reshape(1, -1)
+            p = float(self._model.predict(feats)[0])
+            preds.append(np.clip(p, 0, 1))
+            current = np.append(current, p)
+        preds = np.array(preds)
+        std_est = float(np.std(cpu[-288:])) * 1.5
+        return preds, np.clip(preds - 1.96 * std_est, 0, 1), np.clip(preds + 1.96 * std_est, 0, 1)
+
+
+class CNNLSTMForecaster(BaseForecaster):
+    """CNN-LSTM гибрид: Conv1D для локальных паттернов + LSTM для последовательностей."""
+
+    def __init__(self, seed=42, horizon_h=3, w_input=60,
+                 hidden_dim=64, dropout=0.25, max_epochs=100, batch_size=32, **kwargs):
+        self.horizon_h = horizon_h
+        self.w_input = w_input
+        self.seed = seed
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.max_epochs = max_epochs
+        self.batch_size = batch_size
+        self._trainer = None
+        self._mu = 0.0
+        self._sigma = 1.0
+
+    def fit(self, cpu, ts, phi):
+        import torch, torch.nn as nn
+        from predictor.model import GRUTrainer, TimeSeriesDataset
+        np.random.seed(self.seed)
+
+        self._mu = float(np.mean(cpu[-60:]))
+        self._sigma = max(float(np.std(cpu[-60:])), 1e-8)
+        cpu_norm = (cpu - self._mu) / self._sigma
+
+        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + 1)
+        n_tr = len(cpu_norm) - n_val
+        phi_zeros = np.zeros((3, len(cpu_norm)), dtype=np.float32)
+
+        train_ds = TimeSeriesDataset(cpu_norm[:n_tr], ts[:n_tr], phi_zeros[:, :n_tr], self.w_input)
+        val_ds = TimeSeriesDataset(cpu_norm[n_tr - self.w_input:], ts[n_tr - self.w_input:],
+                                   phi_zeros[:, n_tr - self.w_input:], self.w_input)
+
+        class CNNLSTMNet(nn.Module):
+            def __init__(self_m):
+                super().__init__()
+                self_m.conv = nn.Sequential(
+                    nn.Conv1d(7, 32, kernel_size=3, padding=1),
+                    nn.ReLU(),
+                    nn.Conv1d(32, 32, kernel_size=3, padding=1),
+                    nn.ReLU(),
+                )
+                self_m.lstm = nn.LSTM(32, 64, num_layers=2, batch_first=True, dropout=0.25)
+                self_m.dropout = nn.Dropout(0.25)
+                self_m.head = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.25), nn.Linear(32, 3))
+
+            def forward(self_m, x):
+                # x: (batch, seq, 7) → Conv1D нужен (batch, channels, seq)
+                c = self_m.conv(x.transpose(1, 2)).transpose(1, 2)  # (batch, seq, 32)
+                out, _ = self_m.lstm(c)
+                last = self_m.dropout(out[:, -1, :])
+                return self_m.head(last)
+
+        net = CNNLSTMNet()
+        self._trainer = GRUTrainer(net, quantiles=[0.025, 0.5, 0.975], lr=0.001,
+                                   max_epochs=self.max_epochs, patience=0, batch_size=self.batch_size)
+        self._trainer.fit(train_ds, val_ds)
+
+    def predict(self, cpu, ts, phi):
+        if self._trainer is None:
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
+            return fb, fb * 0.8, fb * 1.2
+        cpu_norm = (cpu - self._mu) / self._sigma
+        w = self.w_input
+        r_window = cpu_norm[-w:]
+        ts_window = ts[-w:]
+        if len(r_window) < w:
+            pad_n = w - len(r_window)
+            r_window = np.concatenate([np.zeros(pad_n), r_window])
+            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
+        hours = (ts_window % 86400) / 3600.0
+        dows = ((ts_window // 86400) % 7).astype(float)
+        minutes = ((ts_window % 3600) / 60.0)
+        X = np.stack([r_window,
+                      np.sin(2*math.pi*hours/24), np.cos(2*math.pi*hours/24),
+                      np.sin(2*math.pi*dows/7), np.cos(2*math.pi*dows/7),
+                      np.sin(2*math.pi*minutes/60), np.cos(2*math.pi*minutes/60)], axis=1)
+        out = self._trainer.predict(X.reshape(1, w, 7))
+        preds = out * self._sigma + self._mu
+        preds = np.clip(preds, 0, 1)
+        return np.full(self.horizon_h, preds[1]), np.full(self.horizon_h, preds[0]), np.full(self.horizon_h, preds[2])
+
+
+class TFTForecaster(BaseForecaster):
+    """Temporal Fusion Transformer (упрощённая реализация на PyTorch)."""
+
+    def __init__(self, seed=42, horizon_h=3, w_input=60,
+                 d_model=32, n_heads=4, dropout=0.25, max_epochs=100, batch_size=32, **kwargs):
+        self.horizon_h = horizon_h
+        self.w_input = w_input
+        self.seed = seed
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.max_epochs = max_epochs
+        self.batch_size = batch_size
+        self._trainer = None
+        self._mu = 0.0
+        self._sigma = 1.0
+
+    def fit(self, cpu, ts, phi):
+        import torch, torch.nn as nn
+        from predictor.model import GRUTrainer, TimeSeriesDataset
+        np.random.seed(self.seed)
+
+        self._mu = float(np.mean(cpu[-60:]))
+        self._sigma = max(float(np.std(cpu[-60:])), 1e-8)
+        cpu_norm = (cpu - self._mu) / self._sigma
+
+        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + 1)
+        n_tr = len(cpu_norm) - n_val
+        phi_zeros = np.zeros((3, len(cpu_norm)), dtype=np.float32)
+
+        train_ds = TimeSeriesDataset(cpu_norm[:n_tr], ts[:n_tr], phi_zeros[:, :n_tr], self.w_input)
+        val_ds = TimeSeriesDataset(cpu_norm[n_tr - self.w_input:], ts[n_tr - self.w_input:],
+                                   phi_zeros[:, n_tr - self.w_input:], self.w_input)
+
+        d_model = self.d_model
+        n_heads = self.n_heads
+
+        class TFTNet(nn.Module):
+            def __init__(self_m):
+                super().__init__()
+                self_m.input_proj = nn.Linear(7, d_model)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 2,
+                    dropout=0.25, batch_first=True)
+                self_m.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+                self_m.head = nn.Sequential(
+                    nn.Linear(d_model, 16), nn.ReLU(), nn.Dropout(0.25), nn.Linear(16, 3))
+
+            def forward(self_m, x):
+                x = self_m.input_proj(x)
+                x = self_m.transformer(x)
+                return self_m.head(x[:, -1, :])
+
+        net = TFTNet()
+        self._trainer = GRUTrainer(net, quantiles=[0.025, 0.5, 0.975], lr=0.001,
+                                   max_epochs=self.max_epochs, patience=0, batch_size=self.batch_size)
+        self._trainer.fit(train_ds, val_ds)
+
+    def predict(self, cpu, ts, phi):
+        if self._trainer is None:
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
+            return fb, fb * 0.8, fb * 1.2
+        cpu_norm = (cpu - self._mu) / self._sigma
+        w = self.w_input
+        r_window = cpu_norm[-w:]
+        ts_window = ts[-w:]
+        if len(r_window) < w:
+            pad_n = w - len(r_window)
+            r_window = np.concatenate([np.zeros(pad_n), r_window])
+            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
+        hours = (ts_window % 86400) / 3600.0
+        dows = ((ts_window // 86400) % 7).astype(float)
+        minutes = ((ts_window % 3600) / 60.0)
+        X = np.stack([r_window,
+                      np.sin(2*math.pi*hours/24), np.cos(2*math.pi*hours/24),
+                      np.sin(2*math.pi*dows/7), np.cos(2*math.pi*dows/7),
+                      np.sin(2*math.pi*minutes/60), np.cos(2*math.pi*minutes/60)], axis=1)
+        out = self._trainer.predict(X.reshape(1, w, 7))
+        preds = out * self._sigma + self._mu
+        preds = np.clip(preds, 0, 1)
+        return np.full(self.horizon_h, preds[1]), np.full(self.horizon_h, preds[0]), np.full(self.horizon_h, preds[2])
 
 
 class AutoGRUForecaster(BaseForecaster):
@@ -111,8 +361,8 @@ class AutoGRUForecaster(BaseForecaster):
     """
 
     def __init__(self, seed=42, horizon_h=3, w_input=60, quantiles=(0.025, 0.5, 0.975),
-                 hidden_dim=64, dropout=0.10, lr=0.001, lr_decay=0.99,
-                 grad_clip=1.0, max_epochs=100, patience=10, batch_size=32, **kwargs):
+                 hidden_dim=64, dropout=0.25, lr=0.001, lr_decay=0.99,
+                 grad_clip=1.0, max_epochs=100, patience=0, batch_size=32, **kwargs):
         self.horizon_h = horizon_h
         self.w_input   = w_input
         self.quantiles = list(quantiles)
@@ -152,7 +402,7 @@ class AutoGRUForecaster(BaseForecaster):
                                       ts[n_tr-self.w_input:],
                                       phi_zeros[:, n_tr-self.w_input:], self.w_input)
 
-        net = GRUQuantileNet(d_in=69, hidden_dim=self.hidden_dim,
+        net = GRUQuantileNet(d_in=7, hidden_dim=self.hidden_dim,
                               dropout=self.dropout, n_quantiles=3)
         self._trainer = GRUTrainer(net, quantiles=self.quantiles, lr=self.lr,
                                     lr_decay=self.lr_decay, grad_clip=self.grad_clip,
@@ -165,29 +415,32 @@ class AutoGRUForecaster(BaseForecaster):
             fallback = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
             return fallback, fallback*0.8, fallback*1.2
 
-        from predictor.forecaster import HybridForecaster
         import math
 
         cpu_norm = (cpu - self._mu) / self._sigma
-        # Строим входной вектор так же, как HybridForecaster
-        r_window = cpu_norm[-self.w_input:]
-        if len(r_window) < self.w_input:
-            r_window = np.pad(r_window, (self.w_input - len(r_window), 0))
+        w = self.w_input
+        r_window = cpu_norm[-w:]
+        ts_window = ts[-w:]
+        if len(r_window) < w:
+            pad_n = w - len(r_window)
+            r_window = np.concatenate([np.zeros(pad_n), r_window])
+            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
 
-        ts_last = ts[-1]
-        hour   = (ts_last % 86400) / 3600.0
-        dow    = (ts_last // 86400) % 7
-        minute = (ts_last % 3600) / 60.0
-        time_feats = np.array([
-            math.sin(2*math.pi*hour/24), math.cos(2*math.pi*hour/24),
-            math.sin(2*math.pi*dow/7),   math.cos(2*math.pi*dow/7),
-            math.sin(2*math.pi*minute/60),math.cos(2*math.pi*minute/60),
-        ])
-        phi_last = phi[:, -1] if phi.shape[1] > 0 else np.array([1/3, 1/3, 1/3])
-        X = np.concatenate([r_window, time_feats, phi_last]).reshape(1, -1)
+        hours = (ts_window % 86400) / 3600.0
+        dows = ((ts_window // 86400) % 7).astype(float)
+        minutes = ((ts_window % 3600) / 60.0)
 
-        out = self._trainer.predict(X)
-        # Обратное преобразование
+        X = np.stack([
+            r_window,
+            np.sin(2 * math.pi * hours / 24),
+            np.cos(2 * math.pi * hours / 24),
+            np.sin(2 * math.pi * dows / 7),
+            np.cos(2 * math.pi * dows / 7),
+            np.sin(2 * math.pi * minutes / 60),
+            np.cos(2 * math.pi * minutes / 60),
+        ], axis=1)  # (w, 7)
+
+        out = self._trainer.predict(X.reshape(1, w, 7))
         preds = out * self._sigma + self._mu
         preds = np.clip(preds, 0, 1)
         return (np.full(self.horizon_h, preds[1]),
@@ -221,18 +474,20 @@ class LSTMForecaster(AutoGRUForecaster):
                                       ts[n_tr-self.w_input:],
                                       phi_zeros[:, n_tr-self.w_input:], self.w_input)
 
-        # Используем LSTM вместо GRU (другой класс)
+        # Используем LSTM вместо GRU (та же структура, другой рекуррентный блок)
         class LSTMQuantileNet(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.lstm1 = nn.LSTM(69, 64, num_layers=1, batch_first=True)
-                self.drop  = nn.Dropout(0.10)
-                self.lstm2 = nn.LSTM(64, 64, num_layers=1, batch_first=True)
-                self.fc    = nn.Linear(64, 3)
+                self.lstm = nn.LSTM(7, 64, num_layers=2, batch_first=True, dropout=0.25)
+                self.dropout = nn.Dropout(0.25)
+                self.head = nn.Sequential(
+                    nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.25),
+                    nn.Linear(32, 3),
+                )
             def forward(self, x):
-                o1,_ = self.lstm1(x); o1=self.drop(o1)
-                o2,_ = self.lstm2(o1)
-                return self.fc(o2[:,-1,:])
+                out, _ = self.lstm(x)
+                last = self.dropout(out[:, -1, :])
+                return self.head(last)
 
         net = LSTMQuantileNet()
         self._trainer = GRUTrainer(net, quantiles=self.quantiles, lr=self.lr,
@@ -323,58 +578,92 @@ def _make_phi(n, dominant_class=None, phase_changes=False):
 
 def generate_stationary(n=4320, seed=42) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Стационарный набор: суточная сезонность p=288, без тренда, умеренный шум.
-    Параметры: параграф 4.2.
+    Стационарный набор: стабильный сервис с предсказуемой суточной нагрузкой.
+    Высокий базовый уровень (~60%), чёткая дневная/ночная разница.
     """
     np.random.seed(seed)
-    t = np.arange(n)
-    seasonal = 0.20 * np.sin(2 * np.pi * t / 288)
-    base     = 0.35
-    noise    = 0.02 * np.random.randn(n)
-    cpu      = np.clip(base + seasonal + noise, 0.05, 0.95)
-    ts       = _make_timestamps(n)
-    phi      = _make_phi(n)
+    t = np.arange(n, dtype=float)
+    # «Рабочий день» — утро-вечер высокая нагрузка, ночью низкая
+    hour_frac = (t % 288) / 288  # 0..1 в течение суток
+    daily = 0.25 * np.exp(-((hour_frac - 0.45) ** 2) / (2 * 0.04))  # пик в ~11:00
+    daily += 0.15 * np.exp(-((hour_frac - 0.65) ** 2) / (2 * 0.03))  # второй пик ~16:00
+    # AR(1) шум
+    noise = np.zeros(n)
+    for i in range(1, n):
+        noise[i] = 0.75 * noise[i-1] + np.random.randn() * 0.03
+    cpu = np.clip(0.35 + daily + noise, 0.05, 0.95)
+    ts  = _make_timestamps(n)
+    phi = _make_phi(n)
     return cpu.astype(np.float32), ts, phi
 
 
 def generate_trend(n=4320, seed=42) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Трендовый набор: линейный рост ~0.002/наблюдение + суточная сезонность.
+    Трендовый набор: нагрузка растёт по мере увеличения аудитории.
+    Начинается с 15%, заканчивается ~75%. Есть 2-3 резких скачка (деплои).
+    Слабая сезонность на фоне сильного тренда.
     """
     np.random.seed(seed)
-    t        = np.arange(n, dtype=float)
-    trend    = 0.20 + 0.002 * (t / 288)    # ~0.002 * сутки
-    seasonal = 0.15 * np.sin(2 * np.pi * t / 288)
-    noise    = 0.02 * np.random.randn(n)
-    cpu      = np.clip(trend + seasonal + noise, 0.05, 0.95)
-    ts       = _make_timestamps(n)
-    phi      = _make_phi(n)
+    t = np.arange(n, dtype=float)
+    # Логистический рост (S-кривая) — имитация роста аудитории
+    midpoint = n * 0.5
+    steepness = 8.0 / n
+    trend = 0.15 + 0.55 / (1 + np.exp(-steepness * (t - midpoint)))
+    # 3 резких скачка (деплои, маркетинговые кампании)
+    jumps = sorted(np.random.choice(range(n // 5, 4 * n // 5), 3, replace=False))
+    for j in jumps:
+        trend[j:] += np.random.uniform(0.03, 0.08)
+    # Слабая сезонность
+    seasonal = 0.06 * np.sin(2 * np.pi * t / 288)
+    noise = np.zeros(n)
+    for i in range(1, n):
+        noise[i] = 0.5 * noise[i-1] + np.random.randn() * 0.025
+    cpu = np.clip(trend + seasonal + noise, 0.05, 0.95)
+    ts  = _make_timestamps(n)
+    phi = _make_phi(n)
     return cpu.astype(np.float32), ts, phi
 
 
 def generate_spike(n=4320, seed=42, amplitude=3.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Всплесковый набор: стационарный фон + пики амплитудой amplitude*σ.
-    Межсобытийные интервалы: пуассоновские со средним 50 наблюдений.
+    Всплесковый набор: спокойный фон с агрессивными аномалиями.
+    Низкий базовый уровень (~25%), но регулярные всплески до 70-95%.
+    Имитирует DDoS, вирусные посты, batch-обработку.
     """
     np.random.seed(seed)
-    t        = np.arange(n)
-    seasonal = 0.15 * np.sin(2 * np.pi * t / 288)
-    base     = 0.35
-    noise    = 0.02 * np.random.randn(n)
-    cpu      = base + seasonal + noise
+    t = np.arange(n, dtype=float)
+    # Низкий спокойный фон
+    seasonal = 0.08 * np.sin(2 * np.pi * t / 288)
+    noise = np.zeros(n)
+    for i in range(1, n):
+        noise[i] = 0.6 * noise[i-1] + np.random.randn() * 0.02
+    cpu = 0.25 + seasonal + noise
 
-    # Добавляем всплески
-    sigma_bg = float(np.std(noise))
-    spike_idx = []
+    # Мощные всплески разного характера
     i = 0
     while i < n:
-        gap = np.random.poisson(50)
+        gap = np.random.poisson(60)
         i += gap
-        if i < n:
-            spike_idx.append(i)
-    for idx in spike_idx:
-        cpu[idx] += amplitude * sigma_bg
+        if i >= n:
+            break
+        spike_type = np.random.choice(['sharp', 'plateau', 'ramp'])
+        amp = np.random.uniform(0.3, 0.65)
+        if spike_type == 'sharp':
+            # Мгновенный пик 1-2 точки
+            dur = np.random.choice([1, 2])
+            for d in range(min(dur, n - i)):
+                cpu[i + d] += amp
+        elif spike_type == 'plateau':
+            # Плато на 5-15 точек (batch job)
+            dur = np.random.randint(5, 16)
+            for d in range(min(dur, n - i)):
+                cpu[i + d] += amp * 0.8
+        else:
+            # Нарастание и спад (вирусный контент)
+            dur = np.random.randint(10, 30)
+            for d in range(min(dur, n - i)):
+                phase = d / dur
+                cpu[i + d] += amp * np.sin(np.pi * phase)
 
     cpu = np.clip(cpu, 0.05, 0.99)
     ts  = _make_timestamps(n)
@@ -384,61 +673,93 @@ def generate_spike(n=4320, seed=42, amplitude=3.0) -> Tuple[np.ndarray, np.ndarr
 
 def generate_mixed(n=4320, seed=42, phase_changes=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Смешанный набор: слабый тренд + сезонность + всплески 2-4σ + нестационарная дисперсия.
-    Опционально — смена доминирующего класса (для теста φ_t).
+    Смешанный набор: реалистичный production-трафик.
+    Тренд + суточная + недельная сезонность + всплески + смена режимов.
+    Средний уровень ~45%, амплитуда суток ~25%, есть «выходные».
     """
     np.random.seed(seed)
-    t        = np.arange(n, dtype=float)
-    trend    = 0.25 + 0.001 * (t / 288)
-    seasonal = 0.18 * np.sin(2 * np.pi * t / 288) + 0.05 * np.sin(4 * np.pi * t / 288)
-    sigma_base = 0.02
-    sigma_vary = sigma_base * (1 + 0.5 * np.abs(np.sin(2 * np.pi * t / (288 * 7))))
-    noise    = sigma_vary * np.random.randn(n)
+    t = np.arange(n, dtype=float)
+    # Слабый тренд
+    trend = 0.30 + 0.002 * (t / 288)
+    # Суточная: пик днём, провал ночью (асимметричная форма)
+    hour_frac = (t % 288) / 288
+    daily = 0.20 * np.exp(-((hour_frac - 0.42) ** 2) / (2 * 0.035))
+    daily += 0.12 * np.exp(-((hour_frac - 0.62) ** 2) / (2 * 0.025))
+    # Недельная: выходные на 30% ниже
+    day_of_week = ((t // 288) % 7).astype(float)
+    weekend = np.where((day_of_week >= 5), -0.12, 0.0)
+    # Нестационарная дисперсия
+    sigma_vary = 0.035 * (1 + 0.6 * np.maximum(daily, 0))
+    noise = np.zeros(n)
+    for i in range(1, n):
+        noise[i] = 0.7 * noise[i-1] + np.random.randn() * sigma_vary[i]
 
-    # Если смена классов активна — добавляем скачок уровня
     if phase_changes:
         segment = n // 4
         level_shift = np.zeros(n)
-        level_shift[segment:2*segment]   = +0.35   # класс 1 доминирует → высокое CPU
-        level_shift[2*segment:3*segment] = -0.15   # класс 2 → низкое CPU
-        level_shift[3*segment:]          = +0.15   # класс 3 → среднее CPU
+        level_shift[segment:2*segment]   = +0.25
+        level_shift[2*segment:3*segment] = -0.10
+        level_shift[3*segment:]          = +0.15
         trend = trend + level_shift
 
-    # Всплески 2-4σ
-    for _ in range(n // 100):
+    # Редкие всплески
+    for _ in range(n // 200):
         idx = np.random.randint(n)
-        trend[idx] += np.random.uniform(2, 4) * sigma_base
+        dur = np.random.randint(3, 10)
+        for d in range(min(dur, n - idx)):
+            trend[idx + d] += np.random.uniform(0.10, 0.25) * np.sin(np.pi * d / dur)
 
-    cpu = np.clip(trend + seasonal + noise, 0.05, 0.99)
+    cpu = np.clip(trend + daily + weekend + noise, 0.05, 0.99)
     ts  = _make_timestamps(n)
     phi = _make_phi(n, phase_changes=phase_changes)
     return cpu.astype(np.float32), ts, phi
 
 
-def load_alibaba_trace(
-    path: str = "data/alibaba_cluster_trace_2018.csv"
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_trace_csv(path: str, max_n: int = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Загружает Alibaba Cluster Trace 2018 (параграф 4.2).
-    Ожидаемый формат CSV: timestamp,cpu_avg
-    Источник: https://github.com/alibaba/clusterdata
+    Универсальный загрузчик реальных датасетов.
+    Формат CSV: timestamp,cpu_avg,rps,mem_avg,lat_p95,err_rate,phi1,phi2,phi3
     """
     import pandas as pd, os
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Alibaba dataset not found at '{path}'. "
-            "Run scripts/download_data.sh to download and preprocess."
-        )
+        raise FileNotFoundError(f"Dataset not found at '{path}'.")
     df = pd.read_csv(path, parse_dates=False)
-    df = df.sort_values("timestamp").dropna()
-    cpu = df["cpu_avg"].values[:2304].astype(np.float32)
-    cpu = np.clip(cpu, 0.01, 0.99)
-    ts  = df["timestamp"].values[:2304].astype(np.int64)
-    # Если timestamps не unix — создаём синтетические
+    df = df.sort_values("timestamp").dropna(subset=["cpu_avg"])
+    n = min(len(df), max_n) if max_n else len(df)
+    cpu = np.clip(df["cpu_avg"].values[:n].astype(np.float32), 0.01, 0.99)
+    ts  = df["timestamp"].values[:n].astype(np.int64)
     if ts.max() < 1e9:
-        ts = _make_timestamps(len(cpu))
-    phi = _make_phi(len(cpu))
+        ts = _make_timestamps(n)
+    if "phi1" in df.columns:
+        phi = np.stack([
+            df["phi1"].values[:n],
+            df["phi2"].values[:n],
+            df["phi3"].values[:n],
+        ]).astype(np.float32)
+    else:
+        phi = _make_phi(n)
     return cpu, ts, phi
+
+
+def load_alibaba_trace(
+    path: str = "data/alibaba_cluster_trace_2018.csv"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Alibaba Cluster Trace 2018 — 2243 точки, 5 реальных метрик, dt=300s."""
+    return _load_trace_csv(path)
+
+
+def load_google_trace(
+    path: str = "data/google_cluster_trace_2019.csv"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Google Cluster Trace 2019 — 8064 точки (~28 дней), dt=300s."""
+    return _load_trace_csv(path)
+
+
+def load_azure_trace(
+    path: str = "data/azure_vm_trace_2019.csv"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Azure VM Trace 2019 — 8640 точек (~30 дней), dt=300s."""
+    return _load_trace_csv(path)
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -18,6 +18,7 @@ import time
 import math
 import json
 import logging
+import os
 import numpy as np
 import yaml
 from scipy.stats import linregress
@@ -123,6 +124,48 @@ def _real_forecast(history_values, horizon_h, period=288, n_T=60, n_cycles=7):
         upper.append(round(float(forecast_val + ci), 4))
 
     return hat, lower, upper
+
+# ── Глобальная обученная модель (подгружается после обучения) ───────────────
+# Параметры по умолчанию (совпадают с config.yaml / test_experiments.py)
+CFG_PREPROCESSOR = dict(w_a=48, iqr_alpha=1.5, w_norm=60, period=288, robust=True)
+CFG_FORECASTER   = dict(n_T=60, n_cycles=7, period=288, horizon_h=3, w_input=60,
+                        quantiles=[0.025, 0.5, 0.975], hidden_dim=64, dropout=0.10,
+                        lr=0.001, lr_decay=0.99, grad_clip=1.0,
+                        max_epochs=100, patience=0, batch_size=32)
+
+_trained_forecaster = None
+_forecaster_lock = threading.Lock()
+
+
+def _load_latest_model():
+    """Ищет последнюю обученную модель в models/ и загружает."""
+    global _trained_forecaster
+    import glob
+    model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+    files = glob.glob(os.path.join(model_dir, "gru_*.pt"))
+    if not files:
+        return
+    latest = max(files, key=os.path.getmtime)
+    try:
+        from predictor.preprocessor import Preprocessor
+        from predictor.forecaster import HybridForecaster
+        pp = Preprocessor(**{k: _cfg.get("preprocessing", {}).get(k, v)
+                             for k, v in CFG_PREPROCESSOR.items()})
+        fc = HybridForecaster(preprocessor=pp, **{
+            k: _cfg.get("model", {}).get(k,
+               _cfg.get("timeseries", {}).get(k,
+               _cfg.get("preprocessing", {}).get(k, v)))
+            for k, v in CFG_FORECASTER.items()})
+        fc.load_model(latest)
+        with _forecaster_lock:
+            _trained_forecaster = fc
+        logger.info(f"Loaded trained model from {latest}")
+    except Exception as e:
+        logger.warning(f"Could not load model from {latest}: {e}")
+
+
+# Дефолтные параметры моделей
+_load_latest_model()
 
 _engine = create_engine(_db_url, pool_pre_ping=True, pool_size=3)
 ExpBase.metadata.create_all(_engine)
@@ -243,13 +286,33 @@ def _demo_generator():
             "timestamp": int(time.time()),
             "iterations": t,
         }
-        # ── Прогноз по реальному алгоритму (формулы 3.11, 3.12) ─────────
+        # ── Прогноз ───────────────────────────────────────────────────────
         with _state_lock:
             hist = list(_state["history"])
         cpu_hist = [h["cpu"] for h in hist] + [round(cpu, 4)]
         rps_hist = [h["rps"] for h in hist] + [round(max(rps, 0), 1)]
 
-        cpu_hat, cpu_lower, cpu_upper = _real_forecast(cpu_hist, horizon_h)
+        cpu_hat, cpu_lower, cpu_upper = None, None, None
+
+        # Пытаемся использовать обученную GRU-модель
+        with _forecaster_lock:
+            fc_model = _trained_forecaster
+        if fc_model is not None and len(cpu_hist) >= fc_model.w_input + 10:
+            try:
+                ts_arr = np.array([h["ts"] for h in hist] + [int(time.time())])
+                phi_arr = np.array([h.get("phi", [0.33, 0.33, 0.34]) for h in hist] + [phi]).T
+                cpu_arr = np.array(cpu_hist)
+                c_hat, c_lo, c_hi = fc_model.predict(cpu_arr, ts_arr, phi_arr)
+                cpu_hat = [round(float(v), 4) for v in c_hat]
+                cpu_lower = [round(float(v), 4) for v in c_lo]
+                cpu_upper = [round(float(v), 4) for v in c_hi]
+            except Exception as e:
+                logger.debug(f"GRU forecast failed, using fallback: {e}")
+
+        # Fallback — линейная экстраполяция
+        if cpu_hat is None:
+            cpu_hat, cpu_lower, cpu_upper = _real_forecast(cpu_hist, horizon_h)
+
         rps_hat, rps_lower, rps_upper = _real_forecast(rps_hist, horizon_h)
 
         point["forecast"] = {
@@ -411,6 +474,43 @@ def api_load_post():
     return jsonify({"ok": True, "load": _state["load"]})
 
 
+@api_app.route("/api/datasets/preview")
+def api_dataset_preview():
+    """Возвращает первые N точек датасета для визуализации."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from tests.data_generators import (
+        generate_stationary, generate_trend, generate_spike,
+        generate_mixed, load_alibaba_trace, load_google_trace, load_azure_trace,
+    )
+    dataset_id = request.args.get("dataset", "mixed")
+    n_points = min(int(request.args.get("n", 500)), 2000)
+
+    loaders = {
+        "alibaba":    load_alibaba_trace,
+        "google":     load_google_trace,
+        "azure":      load_azure_trace,
+        "stationary": generate_stationary,
+        "trend":      generate_trend,
+        "spike":      generate_spike,
+        "mixed":      generate_mixed,
+    }
+    try:
+        loader_fn = loaders.get(dataset_id, generate_mixed)
+        cpu, ts, phi = loader_fn()
+        step = max(1, len(cpu) // n_points)
+        sampled_cpu = cpu[::step][:n_points]
+        sampled_ts = ts[::step][:n_points]
+        return jsonify({
+            "dataset": dataset_id,
+            "total_points": len(cpu),
+            "cpu": [round(float(v), 4) for v in sampled_cpu],
+            "timestamps": [int(v) for v in sampled_ts],
+        })
+    except Exception as e:
+        return jsonify({"dataset": dataset_id, "error": str(e), "cpu": [], "timestamps": []})
+
+
 @api_app.route("/api/training/status")
 def api_training_status():
     """Статус обучения: потери по эпохам."""
@@ -423,53 +523,97 @@ def api_training_status():
 
 @api_app.route("/api/training/start", methods=["POST"])
 def api_training_start():
-    """Запустить обучение в фоновом потоке."""
+    """Запустить реальное обучение HybridForecaster в фоновом потоке."""
     data = request.get_json(force=True) or {}
-    dataset = data.get("dataset", "synthetic_mixed")
+    dataset_id = data.get("dataset", "mixed")
 
-    def _train_demo():
-        max_ep = _runtime_config["max_epochs"]
-        patience = _runtime_config["patience"]
+    with _state_lock:
+        if _state["training"]["running"]:
+            return jsonify({"ok": False, "error": "Обучение уже запущено"}), 409
+
+    def _train_real():
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from predictor.preprocessor import Preprocessor
+        from predictor.forecaster import HybridForecaster
+        from tests.data_generators import (
+            generate_stationary, generate_trend, generate_spike,
+            generate_mixed, load_alibaba_trace,
+        )
 
         with _state_lock:
-            _state["training"]["running"] = True
-            _state["training"]["train_loss"] = []
-            _state["training"]["val_loss"] = []
-            _state["training"]["epoch"] = 0
-            _state["training"]["best_val"] = None
-            _state["training"]["stopped_early"] = False
+            _state["training"].update({
+                "running": True, "epoch": 0,
+                "train_loss": [], "val_loss": [],
+                "best_val": None, "stopped_early": False,
+                "dataset": dataset_id, "error": None,
+            })
 
-        best_val = None
-        no_improve = 0
+        try:
+            # ── 1. Загрузка датасета ─────────────────────────────────────
+            loaders = {
+                "alibaba":    load_alibaba_trace,
+                "stationary": generate_stationary,
+                "trend":      generate_trend,
+                "spike":      generate_spike,
+                "mixed":      generate_mixed,
+            }
+            loader_fn = loaders.get(dataset_id, generate_mixed)
+            cpu_series, timestamps, phi = loader_fn()
+            logger.info(f"Training on dataset '{dataset_id}': {len(cpu_series)} observations")
 
-        for epoch in range(1, max_ep + 1):
-            time.sleep(0.3)           # имитация одной эпохи
-            t_loss = 0.18 * math.exp(-0.08 * epoch) + 0.028 + float(np.random.randn()) * 0.002
-            v_loss = 0.20 * math.exp(-0.07 * epoch) + 0.031 + float(np.random.randn()) * 0.003
+            # ── 2. Создание моделей ──────────────────────────────────────
+            pp = Preprocessor(**{k: _cfg.get("preprocessing", {}).get(k, v)
+                                 for k, v in CFG_PREPROCESSOR.items()})
+            fc_cfg = {k: _cfg.get("model", {}).get(k,
+                        _cfg.get("timeseries", {}).get(k,
+                        _cfg.get("preprocessing", {}).get(k, v)))
+                      for k, v in CFG_FORECASTER.items()}
+            forecaster = HybridForecaster(preprocessor=pp, **fc_cfg)
 
-            if best_val is None or v_loss < best_val:
-                best_val = v_loss
-                no_improve = 0
-            else:
-                no_improve += 1
+            # ── 3. Callback для обновления прогресса по эпохам ────────
+            def on_epoch(epoch, train_loss, val_loss, best_val):
+                with _state_lock:
+                    _state["training"]["epoch"] = epoch
+                    _state["training"]["train_loss"].append(round(train_loss, 4))
+                    _state["training"]["val_loss"].append(round(val_loss, 4))
+                    _state["training"]["best_val"] = round(best_val, 4)
+
+            # ── 4. Обучение ──────────────────────────────────────────────
+            n_train = int(len(cpu_series) * 0.85)
+            forecaster.fit(
+                cpu_series[:n_train],
+                timestamps[:n_train],
+                phi[:, :n_train],
+                val_split=0.15,
+                epoch_callback=on_epoch,
+            )
 
             with _state_lock:
-                _state["training"]["epoch"] = epoch
-                _state["training"]["train_loss"].append(round(t_loss, 4))
-                _state["training"]["val_loss"].append(round(v_loss, 4))
-                _state["training"]["best_val"] = round(best_val, 4)
+                _state["training"]["stopped_early"] = forecaster.trainer.stopped_epoch > 0
 
-            if no_improve >= patience:
-                with _state_lock:
-                    _state["training"]["stopped_early"] = True
-                break
+            # ── 5. Сохранение модели и подключение к мониторингу ────────
+            global _trained_forecaster
+            model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+            os.makedirs(model_dir, exist_ok=True)
+            model_path = os.path.join(model_dir, f"gru_{dataset_id}.pt")
+            forecaster.save_model(model_path)
+            with _forecaster_lock:
+                _trained_forecaster = forecaster
+            logger.info(f"Model saved to {model_path} and connected to monitoring")
 
-        with _state_lock:
-            _state["training"]["running"] = False
+        except Exception as e:
+            logger.error(f"Training failed: {e}", exc_info=True)
+            with _state_lock:
+                _state["training"]["error"] = str(e)
+        finally:
+            with _state_lock:
+                _state["training"]["running"] = False
 
-    thread = threading.Thread(target=_train_demo, daemon=True)
+    # Фоновый поток для обучения, чтобы не блокировать API
+    thread = threading.Thread(target=_train_real, daemon=True)
     thread.start()
-    return jsonify({"ok": True, "dataset": dataset})
+    return jsonify({"ok": True, "dataset": dataset_id})
 
 
 def _latest_run_id(session, experiment, dataset=None):
@@ -557,19 +701,21 @@ def api_compare():
 @api_app.route("/api/datasets")
 def api_datasets():
     """Список доступных наборов данных."""
-    import os
-    alibaba_available = os.path.exists("data/alibaba_cluster_trace_2018.csv")
     return jsonify({
         "datasets": [
             {"id": "alibaba",    "name": "Alibaba Cluster Trace 2018",
-             "type": "real",     "available": alibaba_available, "n_obs": 2304},
-            {"id": "stationary", "name": "Стационарный (синтетический)",
+             "type": "real",     "available": os.path.exists("data/alibaba_cluster_trace_2018.csv"), "n_obs": 2243},
+            {"id": "google",     "name": "Google Cluster Trace 2019",
+             "type": "real",     "available": os.path.exists("data/google_cluster_trace_2019.csv"), "n_obs": 8064},
+            {"id": "azure",      "name": "Azure VM Trace 2019",
+             "type": "real",     "available": os.path.exists("data/azure_vm_trace_2019.csv"), "n_obs": 8640},
+            {"id": "stationary", "name": "Стационарный",
              "type": "synthetic","available": True, "n_obs": 4320},
-            {"id": "trend",      "name": "Трендовый (синтетический)",
+            {"id": "trend",      "name": "Трендовый",
              "type": "synthetic","available": True, "n_obs": 4320},
-            {"id": "spike",      "name": "Всплесковый (синтетический)",
+            {"id": "spike",      "name": "Всплесковый",
              "type": "synthetic","available": True, "n_obs": 4320},
-            {"id": "mixed",      "name": "Смешанный (синтетический)",
+            {"id": "mixed",      "name": "Смешанный",
              "type": "synthetic","available": True, "n_obs": 4320},
         ]
     })
