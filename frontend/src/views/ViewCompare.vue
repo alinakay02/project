@@ -11,11 +11,9 @@
     <div class="toolbar mt-4">
       <label>Набор данных:</label>
       <select v-model="selectedDataset" @change="loadComparison">
-        <option value="alibaba">Alibaba Cluster Trace 2018</option>
-        <option value="stationary">Стационарный</option>
-        <option value="trend">Трендовый</option>
-        <option value="spike">Всплесковый</option>
-        <option value="mixed">Смешанный</option>
+        <option v-for="d in datasets" :key="d.id" :value="d.id">
+          {{ d.name }}
+        </option>
       </select>
       <button class="btn btn-primary" :disabled="runStatus === 'running'" @click="triggerRun('')">
         {{ runStatus === 'running' ? 'Тесты выполняются...' : 'Запустить все тесты' }}
@@ -248,6 +246,7 @@ import { Bar as BarChart, Scatter as ScatterChart } from 'vue-chartjs'
 ChartJS.register(CategoryScale, LinearScale, BarElement, PointElement, LineElement, Tooltip, Legend)
 
 const selectedDataset = ref('alibaba')
+const datasets     = ref([])
 const comparison   = ref([])
 const ablation     = ref([])
 const horizonRows  = ref([])
@@ -390,7 +389,14 @@ async function triggerRun(filter) {
   }
 }
 
-onMounted(loadAll)
+async function fetchDatasets() {
+  try {
+    const { data } = await axios.get('/api/datasets')
+    datasets.value = data.datasets || []
+  } catch {}
+}
+
+onMounted(() => { fetchDatasets(); loadAll() })
 </script>
 
 <style scoped>

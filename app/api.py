@@ -20,6 +20,7 @@ import json
 import logging
 import numpy as np
 import yaml
+from scipy.stats import linregress
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import create_engine, func, desc
@@ -38,7 +39,90 @@ try:
         _cfg = yaml.safe_load(_f)
     _db_url = _cfg["webapp"]["database_url"]
 except Exception:
+    _cfg = {}
     _db_url = "postgresql://appuser:apppass@localhost:5432/appdb"
+
+# ── Параметры из config.yaml, обновляемые через POST /api/config ───────────
+_runtime_config = {
+    "cpu_target":     _cfg.get("decision", {}).get("cpu_target", 0.70),
+    "epsilon":        _cfg.get("decision", {}).get("epsilon", 0.05),
+    "r_min":          _cfg.get("decision", {}).get("r_min", 2),
+    "r_max_cluster":  _cfg.get("decision", {}).get("r_max_cluster", 20),
+    "tau":            _cfg.get("decision", {}).get("tau", 4),
+    "beta":           _cfg.get("decision", {}).get("beta", 0.3),
+    "horizon_h":      _cfg.get("timeseries", {}).get("horizon_h", 3),
+    "dt_minutes":     _cfg.get("timeseries", {}).get("dt_minutes", 5),
+    "max_epochs":     _cfg.get("model", {}).get("max_epochs", 100),
+    "patience":       _cfg.get("model", {}).get("patience", 10),
+    "db_max_conn":    _cfg.get("decision", {}).get("db", {}).get("max_conn", 300),
+    "db_conn_reserve": _cfg.get("decision", {}).get("db", {}).get("conn_reserve", 20),
+    "db_pool_size":   _cfg.get("decision", {}).get("db", {}).get("pool_size", 5),
+}
+_config_lock = threading.Lock()
+
+
+def _real_forecast(history_values, horizon_h, period=288, n_T=60, n_cycles=7):
+    """
+    Прогноз по реальному алгоритму проекта (параграф 3.2.2):
+      - Тренд: линейная экстраполяция МНК (формула 3.11)
+      - Сезонность: усреднение по N_c предыдущим суточным циклам (формула 3.12)
+      - ДИ: на основе дисперсии остатка, расширяется с горизонтом
+    """
+    arr = np.array(history_values, dtype=float)
+    n = len(arr)
+
+    if n < 3:
+        v = float(arr[-1]) if n > 0 else 0.0
+        return [v] * horizon_h, [v] * horizon_h, [v] * horizon_h
+
+    # ── Тренд: скользящее среднее ─────────────────────────────────────
+    win = min(max(n // 4, 3), 30)
+    if win > n:
+        win = n
+    if win % 2 == 0:
+        win = max(win - 1, 1)
+    kernel = np.ones(win) / win
+    # mode='valid' + padding даёт точный размер n
+    pad = win // 2
+    padded = np.pad(arr, pad, mode='edge')
+    trend = np.convolve(padded, kernel, mode='valid')[:n]
+
+    # ── Сезонная компонента (отклонения от тренда) ─────────────────────
+    detrended = arr - trend
+
+    # ── Прогноз тренда: линейная экстраполяция (формула 3.11) ──────────
+    trend_tail = trend[-min(n_T, n):]
+    idx = np.arange(len(trend_tail))
+    slope, intercept, _, _, _ = linregress(idx, trend_tail)
+
+    # ── Стандартное отклонение остатка для ДИ ──────────────────────────
+    resid_std = float(np.std(detrended[-min(60, n):]))
+    if resid_std < 1e-8:
+        resid_std = 0.01
+
+    hat, lower, upper = [], [], []
+    for k in range(1, horizon_h + 1):
+        # T̂_{t+k}: экстраполяция линейного тренда
+        t_hat = slope * (len(trend_tail) + k - 1) + intercept
+
+        # Ŝ_{t+k}: среднее из предыдущих суточных циклов (формула 3.12)
+        s_hat = 0.0
+        season_vals = []
+        for j in range(1, n_cycles + 1):
+            sidx = n - period * j + k - 1
+            if 0 <= sidx < n:
+                season_vals.append(detrended[sidx])
+        if season_vals:
+            s_hat = float(np.mean(season_vals))
+
+        forecast_val = t_hat + s_hat
+        ci = resid_std * 1.96 * math.sqrt(k)
+
+        hat.append(round(float(forecast_val), 4))
+        lower.append(round(float(max(forecast_val - ci, 0)), 4))
+        upper.append(round(float(forecast_val + ci), 4))
+
+    return hat, lower, upper
 
 _engine = create_engine(_db_url, pool_pre_ping=True, pool_size=3)
 ExpBase.metadata.create_all(_engine)
@@ -57,6 +141,7 @@ _state = {
     "load": {"running": False, "users_class1": 0, "users_class2": 0, "users_class3": 0},
     "iterations": 0,
     "history": [],          # список точек {ts, cpu, mem, rps, lat, err, r_cur}
+    "hourly_stats": {},     # ключ "HH" → {cpu_sum, cpu_max, rps_sum, rps_max, count}
     "comparison": None,
 }
 _state_lock = threading.Lock()
@@ -74,24 +159,76 @@ def get_state() -> dict:
 
 # ── Имитационный генератор данных (для демонстрации без реального Prometheus) ─
 def _demo_generator():
-    """Генерирует реалистичный ряд cpu_t для демо-режима."""
+    """Генерирует реалистичный ряд cpu_t для демо-режима.
+
+    Реагирует на состояние нагрузки (_state["load"]):
+      - когда нагрузка запущена — CPU, RPS, память растут пропорционально
+        числу пользователей, φ отражает реальное распределение классов;
+      - когда остановлена — фоновая синусоида с вращающимся доминирующим классом.
+    Конфигурация берётся из _runtime_config (cpu_target, r_min, r_max_cluster).
+    """
     t = 0
+    prev_cpu_hat = None   # 1-step-ahead CPU прогноз с предыдущей итерации
+    prev_rps_hat = None   # 1-step-ahead RPS прогноз с предыдущей итерации
     while True:
-        # Суточная сезонность + тренд + шум
+        # ── Считываем текущее состояние нагрузки ──────────────────────
+        with _state_lock:
+            load = dict(_state["load"])
+
+        load_running = load.get("running", False)
+        u1 = load.get("users_class1", 0)
+        u2 = load.get("users_class2", 0)
+        u3 = load.get("users_class3", 0)
+        total_users = u1 + u2 + u3
+
+        # ── Считываем конфигурацию ────────────────────────────────────
+        with _config_lock:
+            cpu_target = _runtime_config.get("cpu_target", 0.70)
+            r_min = _runtime_config.get("r_min", 2)
+            r_max = _runtime_config.get("r_max_cluster", 20)
+            horizon_h = _runtime_config.get("horizon_h", 3)
+
+        # ── Базовый сезонный сигнал ───────────────────────────────────
         seasonal = 0.20 * math.sin(2 * math.pi * t / 288)
-        trend = 0.35
+        base_cpu = 0.35 + seasonal
         noise = 0.02 * (2 * float(np.random.rand()) - 1)
-        cpu = min(max(trend + seasonal + noise, 0.05), 0.95)
 
-        # Состав классов — периодически меняем доминирующий
-        phase = (t // 120) % 3
-        phi = [0.15, 0.15, 0.15]
-        phi[phase] = 0.70
+        if load_running and total_users > 0:
+            # Нагрузка активна — CPU растёт пропорционально пользователям
+            # При 3000 суммарных пользователей добавляется ~0.45 к CPU
+            load_factor = min(total_users / 3000.0, 1.0)
+            cpu = base_cpu + load_factor * 0.45 + noise
+            # Φ — реальное соотношение классов
+            phi = [u1 / total_users, u2 / total_users, u3 / total_users]
+            # RPS: ~1 запрос/сек на пользователя (Locust wait_time 0.5–1.5с)
+            rps = total_users * 1.0 + float(np.random.randn()) * total_users * 0.02
+            # Память тоже растёт под нагрузкой
+            mem = 0.30 + 0.05 * math.sin(2 * math.pi * t / 144) + load_factor * 0.25
+        else:
+            # Фоновый режим — плавная синусоида
+            cpu = base_cpu + noise
+            phase = (t // 120) % 3
+            phi = [0.15, 0.15, 0.15]
+            phi[phase] = 0.70
+            rps = 30 + 15 * math.sin(2 * math.pi * t / 288) + float(np.random.randn()) * 2
+            mem = 0.30 + 0.05 * math.sin(2 * math.pi * t / 144)
 
-        mem = 0.30 + 0.05 * math.sin(2 * math.pi * t / 144)
-        rps = 30 + 15 * math.sin(2 * math.pi * t / 288) + float(np.random.randn()) * 2
+        cpu = min(max(cpu, 0.05), 0.95)
+        mem = min(max(mem, 0.05), 0.95)
         lat = 80 + 40 * cpu + float(np.random.randn()) * 5
         err = max(0, 0.001 + 0.01 * max(0, cpu - 0.8))
+
+        r_cur = max(r_min, min(r_max, math.ceil(cpu / cpu_target)))
+
+        # Определяем действие масштабирования
+        with _state_lock:
+            prev_r = _state.get("r_cur", r_min)
+        if r_cur > prev_r:
+            action = "scale_up"
+        elif r_cur < prev_r:
+            action = "scale_down"
+        else:
+            action = "no_change"
 
         point = {
             "cpu_t": round(cpu, 4),
@@ -100,15 +237,24 @@ def _demo_generator():
             "lat_t": round(lat, 1),
             "err_t": round(err, 5),
             "phi":   [round(p, 3) for p in phi],
-            "r_cur": max(2, min(20, math.ceil(cpu / 0.70))),
+            "r_cur": r_cur,
+            "action": action,
+            "saturation": r_cur >= r_max,
             "timestamp": int(time.time()),
             "iterations": t,
         }
-        # Простой «прогноз» для демо
+        # ── Прогноз по реальному алгоритму (формулы 3.11, 3.12) ─────────
+        with _state_lock:
+            hist = list(_state["history"])
+        cpu_hist = [h["cpu"] for h in hist] + [round(cpu, 4)]
+        rps_hist = [h["rps"] for h in hist] + [round(max(rps, 0), 1)]
+
+        cpu_hat, cpu_lower, cpu_upper = _real_forecast(cpu_hist, horizon_h)
+        rps_hat, rps_lower, rps_upper = _real_forecast(rps_hist, horizon_h)
+
         point["forecast"] = {
-            "cpu_hat": [round(cpu + 0.02*k, 4) for k in range(1, 4)],
-            "q_lower": [round(cpu + 0.02*k - 0.08, 4) for k in range(1, 4)],
-            "q_upper": [round(cpu + 0.02*k + 0.08, 4) for k in range(1, 4)],
+            "cpu_hat": cpu_hat, "q_lower": cpu_lower, "q_upper": cpu_upper,
+            "rps_hat": rps_hat, "rps_lower": rps_lower, "rps_upper": rps_upper,
         }
 
         with _state_lock:
@@ -116,8 +262,10 @@ def _demo_generator():
             _state["history"].append({
                 "ts":    point["timestamp"],
                 "cpu":   point["cpu_t"],
+                "cpu_pred": prev_cpu_hat,       # что модель предсказывала для этой точки
                 "mem":   point["mem_t"],
                 "rps":   point["rps_t"],
+                "rps_pred": prev_rps_hat,       # что модель предсказывала для этой точки
                 "lat":   point["lat_t"],
                 "err":   point["err_t"],
                 "r_cur": point["r_cur"],
@@ -125,6 +273,33 @@ def _demo_generator():
             })
             if len(_state["history"]) > 500:
                 _state["history"] = _state["history"][-500:]
+
+            # ── Почасовая аккумуляция для суточного графика ───────────
+            hour_key = time.strftime("%H")
+            hs = _state["hourly_stats"]
+            if hour_key not in hs:
+                hs[hour_key] = {"cpu_sum": 0, "cpu_max": 0,
+                                "rps_sum": 0, "rps_max": 0,
+                                "cpu_pred_sum": 0, "rps_pred_sum": 0,
+                                "lat_sum": 0, "err_sum": 0, "count": 0}
+            bucket = hs[hour_key]
+            bucket["cpu_sum"] += cpu
+            bucket["cpu_max"] = max(bucket["cpu_max"], cpu)
+            bucket["rps_sum"] += max(rps, 0)
+            bucket["rps_max"] = max(bucket["rps_max"], max(rps, 0))
+            bucket["lat_sum"] += lat
+            bucket["err_sum"] += err
+            # Прогнозные значения (1-step-ahead с прошлой итерации)
+            if prev_cpu_hat is not None:
+                bucket["cpu_pred_sum"] = bucket.get("cpu_pred_sum", 0) + prev_cpu_hat
+            if prev_rps_hat is not None:
+                bucket["rps_pred_sum"] = bucket.get("rps_pred_sum", 0) + prev_rps_hat
+            bucket["count"] += 1
+
+        # Сохраняем 1-step-ahead прогноз для следующей итерации
+        fc = point["forecast"]
+        prev_cpu_hat = fc["cpu_hat"][0] if fc["cpu_hat"] else None
+        prev_rps_hat = fc["rps_hat"][0] if fc["rps_hat"] else None
 
         t += 1
         time.sleep(5)   # Δt = 5 мин в реальности, 5 сек в демо
@@ -153,9 +328,9 @@ def api_status():
             "phi":    s.get("phi", [0.33, 0.33, 0.34]),
         },
         "replicas": {
-            "current":   s.get("r_cur", 2),
-            "r_min":     2,
-            "r_max":     20,
+            "current":   s.get("r_cur", _runtime_config["r_min"]),
+            "r_min":     _runtime_config["r_min"],
+            "r_max":     _runtime_config["r_max_cluster"],
             "action":    s.get("action", "no_change"),
             "saturation": s.get("saturation", False),
         },
@@ -172,6 +347,41 @@ def api_history():
     with _state_lock:
         hist = _state["history"][-n:]
     return jsonify({"history": hist, "count": len(hist)})
+
+
+@api_app.route("/api/history/daily")
+def api_history_daily():
+    """Почасовая статистика за последние 24 часа."""
+    with _state_lock:
+        hs = dict(_state["hourly_stats"])
+
+    # Формируем 24 слота (00..23), заполняем имеющимися данными
+    result = []
+    for h_int in range(24):
+        key = f"{h_int:02d}"
+        label = f"{key}:00"
+        if key in hs:
+            s = hs[key]
+            c = s["count"] or 1
+            result.append({
+                "hour": label,
+                "cpu_avg": round(s["cpu_sum"] / c, 4),
+                "cpu_max": round(s["cpu_max"], 4),
+                "cpu_pred_avg": round(s.get("cpu_pred_sum", 0) / c, 4),
+                "rps_avg": round(s["rps_sum"] / c, 1),
+                "rps_max": round(s["rps_max"], 1),
+                "rps_pred_avg": round(s.get("rps_pred_sum", 0) / c, 1),
+                "lat_avg": round(s["lat_sum"] / c, 1),
+                "count": s["count"],
+            })
+        else:
+            result.append({
+                "hour": label,
+                "cpu_avg": None, "cpu_max": None, "cpu_pred_avg": None,
+                "rps_avg": None, "rps_max": None, "rps_pred_avg": None,
+                "lat_avg": None, "count": 0,
+            })
+    return jsonify({"hourly": result})
 
 
 @api_app.route("/api/load", methods=["GET"])
@@ -206,6 +416,8 @@ def api_training_status():
     """Статус обучения: потери по эпохам."""
     with _state_lock:
         t = dict(_state["training"])
+    t["max_epochs"] = _runtime_config["max_epochs"]
+    t["patience"] = _runtime_config["patience"]
     return jsonify(t)
 
 
@@ -216,22 +428,41 @@ def api_training_start():
     dataset = data.get("dataset", "synthetic_mixed")
 
     def _train_demo():
+        max_ep = _runtime_config["max_epochs"]
+        patience = _runtime_config["patience"]
+
         with _state_lock:
             _state["training"]["running"] = True
             _state["training"]["train_loss"] = []
             _state["training"]["val_loss"] = []
             _state["training"]["epoch"] = 0
+            _state["training"]["best_val"] = None
+            _state["training"]["stopped_early"] = False
 
-        for epoch in range(1, 44):   # ~43 эпохи как в таблице 4.4
+        best_val = None
+        no_improve = 0
+
+        for epoch in range(1, max_ep + 1):
             time.sleep(0.3)           # имитация одной эпохи
             t_loss = 0.18 * math.exp(-0.08 * epoch) + 0.028 + float(np.random.randn()) * 0.002
             v_loss = 0.20 * math.exp(-0.07 * epoch) + 0.031 + float(np.random.randn()) * 0.003
+
+            if best_val is None or v_loss < best_val:
+                best_val = v_loss
+                no_improve = 0
+            else:
+                no_improve += 1
+
             with _state_lock:
                 _state["training"]["epoch"] = epoch
                 _state["training"]["train_loss"].append(round(t_loss, 4))
                 _state["training"]["val_loss"].append(round(v_loss, 4))
-                _state["training"]["best_val"] = round(min(
-                    v_loss, _state["training"].get("best_val") or v_loss), 4)
+                _state["training"]["best_val"] = round(best_val, 4)
+
+            if no_improve >= patience:
+                with _state_lock:
+                    _state["training"]["stopped_early"] = True
+                break
 
         with _state_lock:
             _state["training"]["running"] = False
@@ -346,25 +577,22 @@ def api_datasets():
 
 @api_app.route("/api/config", methods=["GET"])
 def api_config_get():
-    """Текущая конфигурация модуля принятия решений."""
-    return jsonify({
-        "cpu_target":   0.70,
-        "epsilon":      0.05,
-        "r_min":        2,
-        "r_max_cluster": 20,
-        "tau":          4,
-        "beta":         0.3,
-        "horizon_h":    3,
-        "dt_minutes":   5,
-    })
+    """Текущая конфигурация — из config.yaml + runtime-обновления."""
+    with _config_lock:
+        return jsonify(dict(_runtime_config))
 
 
 @api_app.route("/api/config", methods=["POST"])
 def api_config_post():
-    """Обновить параметры (tau, beta, cpu_target)."""
+    """Обновить параметры (tau, beta, cpu_target и др.)."""
     data = request.get_json(force=True)
-    allowed = {"tau", "beta", "cpu_target", "horizon_h"}
-    updated = {k: v for k, v in data.items() if k in allowed}
+    allowed = {"tau", "beta", "cpu_target", "horizon_h", "r_min", "r_max_cluster", "epsilon"}
+    updated = {}
+    with _config_lock:
+        for k, v in data.items():
+            if k in allowed:
+                _runtime_config[k] = v
+                updated[k] = v
     logger.info(f"Config updated: {updated}")
     return jsonify({"ok": True, "updated": updated})
 

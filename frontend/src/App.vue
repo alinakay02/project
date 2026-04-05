@@ -43,16 +43,17 @@ import axios from 'axios'
 
 const iterations = ref(0)
 const replicas   = ref(2)
+const rMax       = ref(20)
 const saturation = ref(false)
 
 const statusClass = computed(() => {
   if (saturation.value) return 'status-dot--warn'
-  if (replicas.value >= 19) return 'status-dot--alert'
+  if (replicas.value >= rMax.value - 1) return 'status-dot--alert'
   return 'status-dot--ok'
 })
 const statusText = computed(() => {
   if (saturation.value) return 'Насыщение ресурсов'
-  return `${replicas.value} / 20 реплик`
+  return `${replicas.value} / ${rMax.value} реплик`
 })
 
 let timer = null
@@ -61,6 +62,7 @@ async function poll() {
     const { data } = await axios.get('/api/status')
     iterations.value = data.iterations || 0
     replicas.value   = data.replicas?.current || 2
+    rMax.value       = data.replicas?.r_max || 20
     saturation.value = data.replicas?.saturation || false
   } catch {}
 }

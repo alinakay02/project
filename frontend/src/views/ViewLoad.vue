@@ -117,36 +117,52 @@
 
         </div>
 
-        <!-- Ограничения БД -->
+        <!-- Фактические метрики системы (live от бэкенда) -->
         <div class="card mt-4">
-          <div class="card-title">Ограничения СУБД</div>
-          <div class="db-limits">
-            <div class="dl-row">
-              <span class="dl-k">max_conn</span><span class="dl-v">300</span>
+          <div class="card-title">Фактические метрики системы</div>
+          <div class="live-metrics">
+            <div class="lm-row">
+              <span class="lm-k">CPU утилизация</span>
+              <span class="lm-v" :style="{ color: liveMetrics.cpu_t > config.cpu_target ? '#dd6b20' : '#276749' }">
+                {{ (liveMetrics.cpu_t * 100).toFixed(1) }}%
+              </span>
             </div>
-            <div class="dl-row">
-              <span class="dl-k">conn_reserve</span><span class="dl-v">20</span>
+            <div class="lm-row">
+              <span class="lm-k">RPS</span>
+              <span class="lm-v">{{ liveMetrics.rps_t?.toFixed(1) }}</span>
             </div>
-            <div class="dl-row">
-              <span class="dl-k">pool_size (на реплику)</span><span class="dl-v">5</span>
+            <div class="lm-row">
+              <span class="lm-k">Память</span>
+              <span class="lm-v">{{ (liveMetrics.mem_t * 100).toFixed(1) }}%</span>
             </div>
-            <div class="dl-row">
-              <span class="dl-k">Максимум реплик (СУБД)</span>
-              <span class="dl-v" style="color:#38a169">56 реплик</span>
+            <div class="lm-row">
+              <span class="lm-k">Задержка P95</span>
+              <span class="lm-v">{{ liveMetrics.lat_t?.toFixed(0) }} мс</span>
             </div>
-            <div class="dl-row">
-              <span class="dl-k">Максимум реплик (кластер)</span>
-              <span class="dl-v" style="color:#dd6b20">20 реплик — активный лимит</span>
+            <div class="lm-row">
+              <span class="lm-k">Реплик</span>
+              <span class="lm-v">{{ liveMetrics.r_cur }}</span>
+            </div>
+          </div>
+          <div class="phi-preview mt-4">
+            <div class="card-title">Фактический состав классов (φ)</div>
+            <div v-for="(v, i) in liveMetrics.phi" :key="'actual-'+i" class="phi-row">
+              <div class="phi-label" :style="{ color: classColors[i] }">Класс {{ i+1 }}</div>
+              <div class="phi-bar-wrap">
+                <div class="phi-bar-fill" :style="{ width: (v*100)+'%', background: classColors[i] }"></div>
+              </div>
+              <div class="phi-pct">{{ (v*100).toFixed(1) }}%</div>
             </div>
           </div>
         </div>
+
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 
 const users1 = ref(100)
@@ -155,12 +171,69 @@ const users3 = ref(100)
 const isRunning = ref(false)
 const classColors = ['#3182ce', '#38a169', '#805ad5']
 
+const config = ref({ cpu_target: 0.70, r_max_cluster: 20 })
+
+// Фактические метрики от бэкенда (обновляются каждые 5 сек)
+const liveMetrics = ref({
+  cpu_t: 0, mem_t: 0, rps_t: 0, lat_t: 0, err_t: 0,
+  phi: [0.33, 0.33, 0.34], r_cur: 2
+})
+
 const canStart = computed(() => !isRunning.value && (users1.value + users2.value + users3.value) > 0)
 
 const totalUsers = computed(() => users1.value + users2.value + users3.value)
 const expectedPhi = computed(() => {
   const t = totalUsers.value || 1
   return [users1.value/t, users2.value/t, users3.value/t]
+})
+
+async function fetchLoadState() {
+  try {
+    const { data } = await axios.get('/api/load')
+    isRunning.value = data.running || false
+    if (data.users_class1 != null) users1.value = data.users_class1
+    if (data.users_class2 != null) users2.value = data.users_class2
+    if (data.users_class3 != null) users3.value = data.users_class3
+  } catch {}
+}
+
+async function fetchConfig() {
+  try {
+    const { data } = await axios.get('/api/config')
+    config.value = { ...config.value, ...data }
+  } catch {}
+}
+
+async function pollMetrics() {
+  try {
+    const { data } = await axios.get('/api/status')
+    liveMetrics.value = {
+      cpu_t: data.metrics?.cpu_t || 0,
+      mem_t: data.metrics?.mem_t || 0,
+      rps_t: data.metrics?.rps_t || 0,
+      lat_t: data.metrics?.lat_t || 0,
+      err_t: data.metrics?.err_t || 0,
+      phi: data.metrics?.phi || [0.33, 0.33, 0.34],
+      r_cur: data.replicas?.current || 2,
+    }
+  } catch {}
+}
+
+// Автоматическая отправка изменений слайдеров, пока нагрузка запущена
+async function sendLoadUpdate() {
+  if (!isRunning.value) return
+  try {
+    await axios.post('/api/load', {
+      running: true,
+      users_class1: users1.value,
+      users_class2: users2.value,
+      users_class3: users3.value,
+    })
+  } catch {}
+}
+
+watch([users1, users2, users3], () => {
+  if (isRunning.value) sendLoadUpdate()
 })
 
 async function startLoad() {
@@ -192,6 +265,15 @@ function setPreset(name) {
   const [u1,u2,u3] = presets[name] || [10,10,10]
   users1.value = u1; users2.value = u2; users3.value = u3
 }
+
+let metricsTimer = null
+onMounted(() => {
+  fetchConfig()
+  fetchLoadState()
+  pollMetrics()
+  metricsTimer = setInterval(pollMetrics, 5000)
+})
+onUnmounted(() => clearInterval(metricsTimer))
 </script>
 
 <style scoped>
@@ -230,9 +312,10 @@ function setPreset(name) {
 .phi-bar-fill { height: 100%; border-radius: 4px; transition: width .4s }
 .phi-pct { width: 42px; font-size: 12px; color: #1a202c; text-align: right }
 
-.db-limits { display: flex; flex-direction: column; gap: 8px }
-.dl-row    { display: flex; justify-content: space-between; align-items: center;
-             padding: 6px 0; border-bottom: 1px solid #edf2f7 }
-.dl-k      { font-size: 12px; color: #718096 }
-.dl-v      { font-size: 13px; font-weight: 600; color: #1a202c }
+.live-metrics { display: flex; flex-direction: column; gap: 0 }
+.lm-row { display: flex; justify-content: space-between; align-items: center;
+          padding: 6px 0; border-bottom: 1px solid #edf2f7 }
+.lm-k   { font-size: 12px; color: #718096 }
+.lm-v   { font-size: 14px; font-weight: 600; color: #1a202c }
+
 </style>

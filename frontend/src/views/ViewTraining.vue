@@ -32,6 +32,7 @@
               <span v-if="training.best_val">
                 | best val_loss = {{ training.best_val.toFixed(4) }}
               </span>
+              <span style="color:#718096"> | patience = {{ training.patience }}</span>
             </div>
             <div class="progress-bar">
               <div class="progress-fill" :style="{ width: epochPct + '%' }"></div>
@@ -39,7 +40,9 @@
           </div>
           <div v-if="!training.running && training.epoch > 0" class="result-box mt-4">
             <span class="badge badge-green">Обучение завершено</span>
-            на эпохе {{ training.epoch }} (ранняя остановка, patience = 10)
+            на эпохе {{ training.epoch }}
+            <span v-if="training.stopped_early"> (ранняя остановка, patience = {{ training.patience }})</span>
+            <span v-else> (все {{ maxEpochs }} эпох)</span>
             <div class="mt-8" style="font-size:12px;color:#718096">
               Итоговый val_loss = {{ training.best_val?.toFixed(4) || '—' }}
             </div>
@@ -76,12 +79,13 @@ import { Chart as ChartJS, CategoryScale, LinearScale,
 import { Line as LineChart } from 'vue-chartjs'
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
 
-const training = ref({ running:false, epoch:0, train_loss:[], val_loss:[], best_val: null })
+const training = ref({ running:false, epoch:0, train_loss:[], val_loss:[], best_val: null,
+                       max_epochs: 100, patience: 10, stopped_early: false })
 const datasets = ref([])
 const selectedDataset = ref('mixed')
-const maxEpochs = 100
 
-const epochPct = computed(() => (training.value.epoch / maxEpochs) * 100)
+const maxEpochs = computed(() => training.value.max_epochs || 100)
+const epochPct = computed(() => (training.value.epoch / maxEpochs.value) * 100)
 
 const lossChartData = computed(() => ({
   labels: training.value.train_loss.map((_, i) => i + 1),
