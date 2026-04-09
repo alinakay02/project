@@ -56,13 +56,31 @@ from tests.metrics import (
 
 logging.basicConfig(level=logging.WARNING)
 
+# ── Проверка CUDA на старте сессии ────────────────────────────────────────
+import torch as _torch
+_CUDA_OK = _torch.cuda.is_available()
+print(
+    f"\n[ENV] PyTorch={_torch.__version__} | CUDA available={_CUDA_OK} | "
+    f"device={_torch.cuda.get_device_name(0) if _CUDA_OK else 'CPU'}",
+    flush=True,
+)
+if not _CUDA_OK:
+    msg = (
+        "[ENV][WARN] CUDA НЕ ДОСТУПНА — обучение пойдёт на CPU и будет МЕДЛЕННО.\n"
+        "             Установите GPU-сборку PyTorch:\n"
+        "             pip install --force-reinstall torch==2.1.2+cu121 "
+        "--index-url https://download.pytorch.org/whl/cu121"
+    )
+    print(msg, flush=True)
+    warnings.warn(msg, stacklevel=2)
+
 SEEDS = [42, 137, 256]
 
 CFG_PREPROCESSOR = dict(w_a=48, iqr_alpha=1.5, w_norm=60, period=288, robust=True)
 CFG_FORECASTER   = dict(n_T=60, n_cycles=7, period=288, horizon_h=3, w_input=60,
-                        quantiles=[0.025, 0.5, 0.975], hidden_dim=64, dropout=0.25,
-                        lr=0.001, lr_decay=0.99, grad_clip=1.0,
-                        max_epochs=100, patience=0, batch_size=32)
+                        quantiles=[0.025, 0.5, 0.975], hidden_dim=96, dropout=0.20,
+                        lr=1e-3, lr_decay=0.99, grad_clip=1.0,
+                        max_epochs=60, patience=8, batch_size=64)
 CFG_DECISION     = dict(cpu_target=0.70, epsilon=0.05, r_min=2, r_max_cluster=8,
                         tau=4, beta=0.3, max_conn=100, conn_reserve=10, pool_size=5)
 N_OBS_SYNTHETIC  = 4_320

@@ -188,313 +188,235 @@ class RandomForestForecaster(BaseForecaster):
         return preds, np.clip(preds - 1.96 * std_est, 0, 1), np.clip(preds + 1.96 * std_est, 0, 1)
 
 
-class CNNLSTMForecaster(BaseForecaster):
-    """CNN-LSTM гибрид: Conv1D для локальных паттернов + LSTM для последовательностей."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Общая инфраструктура нейросетевых базовых методов
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, seed=42, horizon_h=3, w_input=60,
-                 hidden_dim=64, dropout=0.25, max_epochs=100, batch_size=32, **kwargs):
-        self.horizon_h = horizon_h
-        self.w_input = w_input
-        self.seed = seed
-        self.hidden_dim = hidden_dim
-        self.dropout = dropout
-        self.max_epochs = max_epochs
-        self.batch_size = batch_size
-        self._trainer = None
-        self._mu = 0.0
-        self._sigma = 1.0
-
-    def fit(self, cpu, ts, phi):
-        import torch, torch.nn as nn
-        from predictor.model import GRUTrainer, TimeSeriesDataset
-        np.random.seed(self.seed)
-
-        self._mu = float(np.mean(cpu[-60:]))
-        self._sigma = max(float(np.std(cpu[-60:])), 1e-8)
-        cpu_norm = (cpu - self._mu) / self._sigma
-
-        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + 1)
-        n_tr = len(cpu_norm) - n_val
-        phi_zeros = np.zeros((3, len(cpu_norm)), dtype=np.float32)
-
-        train_ds = TimeSeriesDataset(cpu_norm[:n_tr], ts[:n_tr], phi_zeros[:, :n_tr], self.w_input)
-        val_ds = TimeSeriesDataset(cpu_norm[n_tr - self.w_input:], ts[n_tr - self.w_input:],
-                                   phi_zeros[:, n_tr - self.w_input:], self.w_input)
-
-        class CNNLSTMNet(nn.Module):
-            def __init__(self_m):
-                super().__init__()
-                self_m.conv = nn.Sequential(
-                    nn.Conv1d(7, 32, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv1d(32, 32, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                )
-                self_m.lstm = nn.LSTM(32, 64, num_layers=2, batch_first=True, dropout=0.25)
-                self_m.dropout = nn.Dropout(0.25)
-                self_m.head = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.25), nn.Linear(32, 3))
-
-            def forward(self_m, x):
-                # x: (batch, seq, 7) → Conv1D нужен (batch, channels, seq)
-                c = self_m.conv(x.transpose(1, 2)).transpose(1, 2)  # (batch, seq, 32)
-                out, _ = self_m.lstm(c)
-                last = self_m.dropout(out[:, -1, :])
-                return self_m.head(last)
-
-        net = CNNLSTMNet()
-        self._trainer = GRUTrainer(net, quantiles=[0.025, 0.5, 0.975], lr=0.001,
-                                   max_epochs=self.max_epochs, patience=0, batch_size=self.batch_size)
-        self._trainer.fit(train_ds, val_ds)
-
-    def predict(self, cpu, ts, phi):
-        if self._trainer is None:
-            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
-            return fb, fb * 0.8, fb * 1.2
-        cpu_norm = (cpu - self._mu) / self._sigma
-        w = self.w_input
-        r_window = cpu_norm[-w:]
-        ts_window = ts[-w:]
-        if len(r_window) < w:
-            pad_n = w - len(r_window)
-            r_window = np.concatenate([np.zeros(pad_n), r_window])
-            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
-        hours = (ts_window % 86400) / 3600.0
-        dows = ((ts_window // 86400) % 7).astype(float)
-        minutes = ((ts_window % 3600) / 60.0)
-        X = np.stack([r_window,
-                      np.sin(2*math.pi*hours/24), np.cos(2*math.pi*hours/24),
-                      np.sin(2*math.pi*dows/7), np.cos(2*math.pi*dows/7),
-                      np.sin(2*math.pi*minutes/60), np.cos(2*math.pi*minutes/60)], axis=1)
-        out = self._trainer.predict(X.reshape(1, w, 7))
-        preds = out * self._sigma + self._mu
-        preds = np.clip(preds, 0, 1)
-        return np.full(self.horizon_h, preds[1]), np.full(self.horizon_h, preds[0]), np.full(self.horizon_h, preds[2])
+def _build_features_window(cpu_norm, ts, w):
+    """(w, 7) — нормализованный сигнал + 6 тригонометрических признаков времени."""
+    r_window = cpu_norm[-w:]
+    ts_window = ts[-w:]
+    if len(r_window) < w:
+        pad_n = w - len(r_window)
+        r_window = np.concatenate([np.zeros(pad_n, dtype=np.float32), r_window])
+        ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
+    hours = (ts_window % 86400) / 3600.0
+    dows = ((ts_window // 86400) % 7).astype(float)
+    minutes = (ts_window % 3600) / 60.0
+    X = np.stack([
+        r_window.astype(np.float32),
+        np.sin(2 * math.pi * hours / 24).astype(np.float32),
+        np.cos(2 * math.pi * hours / 24).astype(np.float32),
+        np.sin(2 * math.pi * dows / 7).astype(np.float32),
+        np.cos(2 * math.pi * dows / 7).astype(np.float32),
+        np.sin(2 * math.pi * minutes / 60).astype(np.float32),
+        np.cos(2 * math.pi * minutes / 60).astype(np.float32),
+    ], axis=1)
+    return X
 
 
-class TFTForecaster(BaseForecaster):
-    """Temporal Fusion Transformer (упрощённая реализация на PyTorch)."""
-
-    def __init__(self, seed=42, horizon_h=3, w_input=60,
-                 d_model=32, n_heads=4, dropout=0.25, max_epochs=100, batch_size=32, **kwargs):
-        self.horizon_h = horizon_h
-        self.w_input = w_input
-        self.seed = seed
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.dropout = dropout
-        self.max_epochs = max_epochs
-        self.batch_size = batch_size
-        self._trainer = None
-        self._mu = 0.0
-        self._sigma = 1.0
-
-    def fit(self, cpu, ts, phi):
-        import torch, torch.nn as nn
-        from predictor.model import GRUTrainer, TimeSeriesDataset
-        np.random.seed(self.seed)
-
-        self._mu = float(np.mean(cpu[-60:]))
-        self._sigma = max(float(np.std(cpu[-60:])), 1e-8)
-        cpu_norm = (cpu - self._mu) / self._sigma
-
-        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + 1)
-        n_tr = len(cpu_norm) - n_val
-        phi_zeros = np.zeros((3, len(cpu_norm)), dtype=np.float32)
-
-        train_ds = TimeSeriesDataset(cpu_norm[:n_tr], ts[:n_tr], phi_zeros[:, :n_tr], self.w_input)
-        val_ds = TimeSeriesDataset(cpu_norm[n_tr - self.w_input:], ts[n_tr - self.w_input:],
-                                   phi_zeros[:, n_tr - self.w_input:], self.w_input)
-
-        d_model = self.d_model
-        n_heads = self.n_heads
-
-        class TFTNet(nn.Module):
-            def __init__(self_m):
-                super().__init__()
-                self_m.input_proj = nn.Linear(7, d_model)
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 2,
-                    dropout=0.25, batch_first=True)
-                self_m.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-                self_m.head = nn.Sequential(
-                    nn.Linear(d_model, 16), nn.ReLU(), nn.Dropout(0.25), nn.Linear(16, 3))
-
-            def forward(self_m, x):
-                x = self_m.input_proj(x)
-                x = self_m.transformer(x)
-                return self_m.head(x[:, -1, :])
-
-        net = TFTNet()
-        self._trainer = GRUTrainer(net, quantiles=[0.025, 0.5, 0.975], lr=0.001,
-                                   max_epochs=self.max_epochs, patience=0, batch_size=self.batch_size)
-        self._trainer.fit(train_ds, val_ds)
-
-    def predict(self, cpu, ts, phi):
-        if self._trainer is None:
-            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
-            return fb, fb * 0.8, fb * 1.2
-        cpu_norm = (cpu - self._mu) / self._sigma
-        w = self.w_input
-        r_window = cpu_norm[-w:]
-        ts_window = ts[-w:]
-        if len(r_window) < w:
-            pad_n = w - len(r_window)
-            r_window = np.concatenate([np.zeros(pad_n), r_window])
-            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
-        hours = (ts_window % 86400) / 3600.0
-        dows = ((ts_window // 86400) % 7).astype(float)
-        minutes = ((ts_window % 3600) / 60.0)
-        X = np.stack([r_window,
-                      np.sin(2*math.pi*hours/24), np.cos(2*math.pi*hours/24),
-                      np.sin(2*math.pi*dows/7), np.cos(2*math.pi*dows/7),
-                      np.sin(2*math.pi*minutes/60), np.cos(2*math.pi*minutes/60)], axis=1)
-        out = self._trainer.predict(X.reshape(1, w, 7))
-        preds = out * self._sigma + self._mu
-        preds = np.clip(preds, 0, 1)
-        return np.full(self.horizon_h, preds[1]), np.full(self.horizon_h, preds[0]), np.full(self.horizon_h, preds[2])
-
-
-class AutoGRUForecaster(BaseForecaster):
+class _NeuralBaseline(BaseForecaster):
     """
-    Автономная GRU без STL-декомпозиции (аблация и базовый метод).
-    Та же архитектура, что и в HybridForecaster, но прогнозирует cpu_t напрямую.
+    Общий базовый класс для нейросетевых аналогов прогнозатора.
+    Каждый наследник реализует _build_net() — модель, выдающую (B, h, n_q).
+    Подкласс получает прямой многошаговый квантильный прогноз через тот же
+    GRUTrainer, что и предложенный метод, что обеспечивает честное сравнение.
     """
 
-    def __init__(self, seed=42, horizon_h=3, w_input=60, quantiles=(0.025, 0.5, 0.975),
-                 hidden_dim=64, dropout=0.25, lr=0.001, lr_decay=0.99,
-                 grad_clip=1.0, max_epochs=100, patience=0, batch_size=32, **kwargs):
-        self.horizon_h = horizon_h
-        self.w_input   = w_input
+    def __init__(self, seed=42, horizon_h=3, w_input=60,
+                 quantiles=(0.025, 0.5, 0.975), hidden_dim=64, dropout=0.25,
+                 lr=1e-3, lr_decay=0.99, grad_clip=1.0,
+                 max_epochs=40, patience=6, batch_size=64, **kwargs):
+        self.seed = int(seed)
+        self.horizon_h = int(horizon_h)
+        self.w_input = int(w_input)
         self.quantiles = list(quantiles)
-        self.seed      = seed
-        self.hidden_dim = hidden_dim
-        self.dropout    = dropout
-        self.lr         = lr
-        self.lr_decay   = lr_decay
-        self.grad_clip  = grad_clip
-        self.max_epochs = max_epochs
-        self.patience   = patience
-        self.batch_size = batch_size
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.lr_decay = float(lr_decay)
+        self.grad_clip = float(grad_clip)
+        self.max_epochs = int(max_epochs)
+        self.patience = int(patience)
+        self.batch_size = int(batch_size)
         self._trainer = None
         self._mu = 0.0
         self._sigma = 1.0
 
+    def _build_net(self):
+        raise NotImplementedError
+
     def fit(self, cpu, ts, phi):
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-        from predictor.model import GRUQuantileNet, GRUTrainer, TimeSeriesDataset
+        import torch
+        from predictor.model import GRUTrainer, TimeSeriesDataset
 
         np.random.seed(self.seed)
-        # Нормализуем входной ряд
-        self._mu = float(np.mean(cpu[-60:]))
-        self._sigma = max(float(np.std(cpu[-60:])), 1e-8)
+        torch.manual_seed(self.seed)
+
+        cpu = np.asarray(cpu, dtype=np.float32)
+        ts = np.asarray(ts, dtype=np.int64)
+
+        self._mu = float(np.mean(cpu))
+        self._sigma = max(float(np.std(cpu)), 1e-8)
         cpu_norm = (cpu - self._mu) / self._sigma
 
-        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + 1)
-        n_tr  = len(cpu_norm) - n_val
+        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + self.horizon_h + 4)
+        n_val = min(n_val, len(cpu_norm) - self.w_input - self.horizon_h - 4)
+        n_tr = len(cpu_norm) - n_val
+        if n_tr <= self.w_input + self.horizon_h:
+            return  # слишком короткий ряд — оставим self._trainer = None
 
-        # Создаём фиктивный phi (нули)
-        phi_zeros = np.zeros((3, len(cpu_norm)), dtype=np.float32)
+        train_ds = TimeSeriesDataset(
+            target=cpu_norm[:n_tr], timestamps=ts[:n_tr],
+            w_input=self.w_input, horizon_h=self.horizon_h,
+        )
+        val_start = n_tr - self.w_input
+        val_ds = TimeSeriesDataset(
+            target=cpu_norm[val_start:], timestamps=ts[val_start:],
+            w_input=self.w_input, horizon_h=self.horizon_h,
+        )
 
-        train_ds = TimeSeriesDataset(cpu_norm[:n_tr], ts[:n_tr],
-                                      phi_zeros[:, :n_tr], self.w_input)
-        val_ds   = TimeSeriesDataset(cpu_norm[n_tr-self.w_input:],
-                                      ts[n_tr-self.w_input:],
-                                      phi_zeros[:, n_tr-self.w_input:], self.w_input)
-
-        net = GRUQuantileNet(d_in=7, hidden_dim=self.hidden_dim,
-                              dropout=self.dropout, n_quantiles=3)
-        self._trainer = GRUTrainer(net, quantiles=self.quantiles, lr=self.lr,
-                                    lr_decay=self.lr_decay, grad_clip=self.grad_clip,
-                                    max_epochs=self.max_epochs, patience=self.patience,
-                                    batch_size=self.batch_size)
+        net = self._build_net()
+        self._trainer = GRUTrainer(
+            net, quantiles=self.quantiles, lr=self.lr, lr_decay=self.lr_decay,
+            grad_clip=self.grad_clip, max_epochs=self.max_epochs,
+            patience=self.patience, batch_size=self.batch_size,
+        )
         self._trainer.fit(train_ds, val_ds)
 
     def predict(self, cpu, ts, phi):
         if self._trainer is None:
-            fallback = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
-            return fallback, fallback*0.8, fallback*1.2
-
-        import math
-
+            fb = np.full(self.horizon_h, float(np.mean(cpu[-10:])))
+            return fb, fb * 0.8, fb * 1.2
+        cpu = np.asarray(cpu, dtype=np.float32)
+        ts = np.asarray(ts, dtype=np.int64)
         cpu_norm = (cpu - self._mu) / self._sigma
-        w = self.w_input
-        r_window = cpu_norm[-w:]
-        ts_window = ts[-w:]
-        if len(r_window) < w:
-            pad_n = w - len(r_window)
-            r_window = np.concatenate([np.zeros(pad_n), r_window])
-            ts_window = np.concatenate([np.full(pad_n, ts_window[0]), ts_window])
-
-        hours = (ts_window % 86400) / 3600.0
-        dows = ((ts_window // 86400) % 7).astype(float)
-        minutes = ((ts_window % 3600) / 60.0)
-
-        X = np.stack([
-            r_window,
-            np.sin(2 * math.pi * hours / 24),
-            np.cos(2 * math.pi * hours / 24),
-            np.sin(2 * math.pi * dows / 7),
-            np.cos(2 * math.pi * dows / 7),
-            np.sin(2 * math.pi * minutes / 60),
-            np.cos(2 * math.pi * minutes / 60),
-        ], axis=1)  # (w, 7)
-
-        out = self._trainer.predict(X.reshape(1, w, 7))
-        preds = out * self._sigma + self._mu
-        preds = np.clip(preds, 0, 1)
-        return (np.full(self.horizon_h, preds[1]),
-                np.full(self.horizon_h, preds[0]),
-                np.full(self.horizon_h, preds[2]))
+        X = _build_features_window(cpu_norm, ts, self.w_input)            # (w, 7)
+        out = self._trainer.predict(X)                                     # (h, n_q)
+        # Денормализация
+        preds = out * self._sigma + self._mu                                # (h, n_q)
+        median_idx = self.quantiles.index(0.5) if 0.5 in self.quantiles else len(self.quantiles) // 2
+        cpu_hat = np.clip(preds[:, median_idx], 0.0, 1.0)
+        q_lower = np.clip(preds[:, 0], 0.0, 1.0)
+        q_upper = np.clip(preds[:, -1], 0.0, 1.0)
+        return cpu_hat, q_lower, q_upper
 
 
-class LSTMForecaster(AutoGRUForecaster):
-    """
-    LSTM с теми же гиперпараметрами, что и GRU (параграф 4.1).
-    Переопределяет только тип рекуррентного блока.
-    """
-    def fit(self, cpu, ts, phi):
-        import sys, os
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+class AutoGRUForecaster(_NeuralBaseline):
+    """Автономная GRU без декомпозиции (аблация: тот же GRU, но без EWM-тренда)."""
+
+    def _build_net(self):
+        from predictor.model import GRUQuantileNet
+        return GRUQuantileNet(
+            d_step=7, hidden_dim=self.hidden_dim, n_layers=2,
+            dropout=self.dropout, n_quantiles=len(self.quantiles),
+            horizon_h=self.horizon_h,
+        )
+
+
+class LSTMForecaster(_NeuralBaseline):
+    """LSTM с теми же гиперпараметрами, прямой многошаговый квантильный выход."""
+
+    def _build_net(self):
         import torch.nn as nn
-        from predictor.model import GRUQuantileNet, GRUTrainer, TimeSeriesDataset
+        h, q, w_dropout = self.horizon_h, len(self.quantiles), self.dropout
+        hidden = self.hidden_dim
 
-        np.random.seed(self.seed)
-        self._mu = float(np.mean(cpu[-60:]))
-        self._sigma = max(float(np.std(cpu[-60:])), 1e-8)
-        cpu_norm = (cpu - self._mu) / self._sigma
-
-        n_val = max(int(len(cpu_norm) * 0.15), self.w_input + 1)
-        n_tr  = len(cpu_norm) - n_val
-        phi_zeros = np.zeros((3, len(cpu_norm)), dtype=np.float32)
-
-        train_ds = TimeSeriesDataset(cpu_norm[:n_tr], ts[:n_tr],
-                                      phi_zeros[:, :n_tr], self.w_input)
-        val_ds   = TimeSeriesDataset(cpu_norm[n_tr-self.w_input:],
-                                      ts[n_tr-self.w_input:],
-                                      phi_zeros[:, n_tr-self.w_input:], self.w_input)
-
-        # Используем LSTM вместо GRU (та же структура, другой рекуррентный блок)
         class LSTMQuantileNet(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.lstm = nn.LSTM(7, 64, num_layers=2, batch_first=True, dropout=0.25)
-                self.dropout = nn.Dropout(0.25)
+                self.lstm = nn.LSTM(7, hidden, num_layers=2, batch_first=True,
+                                    dropout=w_dropout)
                 self.head = nn.Sequential(
-                    nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.25),
-                    nn.Linear(32, 3),
+                    nn.LayerNorm(hidden),
+                    nn.Linear(hidden, 64), nn.GELU(), nn.Dropout(w_dropout),
+                    nn.Linear(64, q * h),
                 )
+
             def forward(self, x):
                 out, _ = self.lstm(x)
-                last = self.dropout(out[:, -1, :])
-                return self.head(last)
+                flat = self.head(out[:, -1, :])
+                return flat.view(-1, h, q)
 
-        net = LSTMQuantileNet()
-        self._trainer = GRUTrainer(net, quantiles=self.quantiles, lr=self.lr,
-                                    lr_decay=self.lr_decay, grad_clip=self.grad_clip,
-                                    max_epochs=self.max_epochs, patience=self.patience,
-                                    batch_size=self.batch_size)
-        self._trainer.fit(train_ds, val_ds)
+        return LSTMQuantileNet()
+
+
+class CNNLSTMForecaster(_NeuralBaseline):
+    """CNN-LSTM гибрид: Conv1D для локальных паттернов + LSTM, прямой многошаговый выход."""
+
+    def _build_net(self):
+        import torch.nn as nn
+        h, q, w_dropout = self.horizon_h, len(self.quantiles), self.dropout
+        hidden = self.hidden_dim
+
+        class CNNLSTMNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Sequential(
+                    nn.Conv1d(7, 32, kernel_size=3, padding=1), nn.ReLU(),
+                    nn.Conv1d(32, 32, kernel_size=3, padding=1), nn.ReLU(),
+                )
+                self.lstm = nn.LSTM(32, hidden, num_layers=2, batch_first=True,
+                                    dropout=w_dropout)
+                self.head = nn.Sequential(
+                    nn.LayerNorm(hidden),
+                    nn.Linear(hidden, 64), nn.GELU(), nn.Dropout(w_dropout),
+                    nn.Linear(64, q * h),
+                )
+
+            def forward(self, x):
+                c = self.conv(x.transpose(1, 2)).transpose(1, 2)  # (B, seq, 32)
+                out, _ = self.lstm(c)
+                flat = self.head(out[:, -1, :])
+                return flat.view(-1, h, q)
+
+        return CNNLSTMNet()
+
+
+class TFTForecaster(_NeuralBaseline):
+    """Упрощённый Temporal Fusion Transformer, прямой многошаговый квантильный выход."""
+
+    def __init__(self, seed=42, horizon_h=3, w_input=60,
+                 d_model=32, n_heads=4, dropout=0.25,
+                 max_epochs=40, patience=6, batch_size=64, **kwargs):
+        super().__init__(
+            seed=seed, horizon_h=horizon_h, w_input=w_input,
+            hidden_dim=d_model, dropout=dropout,
+            max_epochs=max_epochs, patience=patience, batch_size=batch_size,
+            **kwargs,
+        )
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+
+    def _build_net(self):
+        import torch.nn as nn
+        d_model, n_heads = self.d_model, self.n_heads
+        h, q, w_dropout = self.horizon_h, len(self.quantiles), self.dropout
+
+        class TFTNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.input_proj = nn.Linear(7, d_model)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
+                    dropout=w_dropout, batch_first=True, activation="gelu",
+                )
+                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+                self.head = nn.Sequential(
+                    nn.LayerNorm(d_model),
+                    nn.Linear(d_model, 64), nn.GELU(), nn.Dropout(w_dropout),
+                    nn.Linear(64, q * h),
+                )
+
+            def forward(self, x):
+                z = self.input_proj(x)
+                z = self.transformer(z)
+                flat = self.head(z[:, -1, :])
+                return flat.view(-1, h, q)
+
+        return TFTNet()
 
 
 class ReactiveHPA(BaseForecaster):

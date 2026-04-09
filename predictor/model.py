@@ -1,207 +1,262 @@
 """
-predictor/model.py — Нейросетевая компонента GRU (параграф 3.2.2)
+predictor/model.py — Нейросетевая компонента: прямой многошаговый квантильный GRU.
 
-Классы:
-  GRUQuantileNet — архитектура: 2 слоя GRU (64), dropout 0.10, 3 квантильных выхода
-  GRUTrainer     — обучение: квантильная функция потерь (формула 3.13), Adam, ранняя остановка
+Архитектура (параграф 3.2.2 диссертации, обновлённая редакция):
+  Вход : последовательность w_input шагов, каждый шаг = 7 признаков
+         [r̃_t, sin h, cos h, sin d, cos d, sin m, cos m]
+  Тело : 2 слоя GRU(hidden_dim) с межслойным dropout
+  Голова: Linear(hidden_dim → 64) + ReLU + Dropout + Linear(64 → n_quantiles*horizon_h)
+  Выход: тензор формы (batch, horizon_h, n_quantiles).
+
+Ключевые отличия от старой версии:
+  • прямой многошаговый прогноз (direct multi-step) — h значений за один forward,
+    а не повторение одного и того же 1-шагового предсказания h раз;
+  • квантильная (pinball) функция потерь усреднена по h*n_q выходам;
+  • явное использование CUDA, если доступна; ранняя остановка работает (patience > 0);
+  • DataLoader использует pin_memory + num_workers=0 на Windows для стабильности.
 """
 
-import math
+from __future__ import annotations
+
 import logging
+from typing import List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, List, Optional
+from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. Квантильная функция потерь (формула 3.13)
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Pinball loss для многошагового квантильного выхода
+# ─────────────────────────────────────────────────────────────────────────────
 
 class QuantileLoss(nn.Module):
     """
-    Pinball loss (квантильная функция потерь, формула 3.13):
-    L_q(y, ŷ) = q * max(y - ŷ, 0) + (1-q) * max(ŷ - y, 0)
-    Суммарная потеря — среднее по трём квантилям.
+    Многошаговая pinball-функция потерь.
+
+    preds  : (batch, horizon_h, n_q)
+    target : (batch, horizon_h)
     """
+
     def __init__(self, quantiles: List[float]):
         super().__init__()
-        self.quantiles = quantiles  # [0.025, 0.5, 0.975]
+        self.register_buffer(
+            "q", torch.tensor(list(quantiles), dtype=torch.float32).view(1, 1, -1)
+        )
 
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        preds  : (batch, n_quantiles)
-        targets: (batch,)
-        """
-        total = torch.zeros(1, device=preds.device)
-        for i, q in enumerate(self.quantiles):
-            e = targets - preds[:, i]
-            total += torch.mean(torch.max(q * e, (q - 1) * e))
-        return total / len(self.quantiles)
+    def forward(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # target: (B, h) → (B, h, 1)
+        e = target.unsqueeze(-1) - preds                      # (B, h, n_q)
+        loss = torch.maximum(self.q * e, (self.q - 1.0) * e)   # (B, h, n_q)
+        return loss.mean()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Архитектура нейронной сети (таблица 4.2)
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Архитектура: прямой многошаговый квантильный GRU
+# ─────────────────────────────────────────────────────────────────────────────
 
 class GRUQuantileNet(nn.Module):
     """
-    Архитектура (таблица 4.2):
-      Вход: последовательность из w_input=60 шагов, каждый с d_step=10 признаками:
-        - 1 значение нормализованного остатка R̃_t
-        - 6 тригонометрических временных признаков (sin/cos час, день, минута)
-        - 3 признака состава классов φ_t
-      GRU слой 1: 64 нейрона
-      Dropout: p = 0.25
-      GRU слой 2: 64 нейрона
-      Dropout: p = 0.25
-      Полносвязный слой: 32 нейрона + ReLU
-      Выходной слой: 3 квантиля (0.025, 0.5, 0.975)
+    Прямой многошаговый квантильный GRU с residual-выходом.
 
-    Параметр d_in сохранён для обратной совместимости API.
+    Архитектурные особенности:
+      • два слоя GRU с межслойным dropout;
+      • голова из LayerNorm + Linear+GELU+Dropout + Linear, выдающая h*n_q значений;
+      • residual-связь: к каждому квантилю добавляется первая компонента входа
+        последнего шага (как правило — нормализованное cpu_t). Это даёт модели
+        «бесплатный» AR(1)-приор и фокусирует обучение на отклонениях от него.
+
+    Параметры:
+      d_step      : число признаков на временной шаг
+      hidden_dim  : размерность скрытого состояния GRU
+      n_layers    : число рекуррентных слоёв
+      dropout     : dropout между слоями GRU и в голове
+      n_quantiles : сколько квантилей предсказывать
+      horizon_h   : горизонт прогноза (число шагов вперёд)
+      residual_idx: индекс признака во входном векторе, который используется
+                    как остаточный приор (по умолчанию 0).
+
+    Параметр d_in оставлен для обратной совместимости.
     """
+
     def __init__(
         self,
-        d_in: int = 69,
-        hidden_dim: int = 64,
+        d_in: int = 8,
+        d_step: int = 8,
+        hidden_dim: int = 96,
         n_layers: int = 2,
-        dropout: float = 0.25,
+        dropout: float = 0.20,
         n_quantiles: int = 3,
+        horizon_h: int = 3,
+        residual_idx: int = 0,
     ):
         super().__init__()
-        self.d_in = d_in
-        self.d_step = 7          # признаков на один временной шаг: residual + 6 time
+        self.d_step = d_step
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
+        self.n_quantiles = n_quantiles
+        self.horizon_h = horizon_h
+        self.residual_idx = int(residual_idx)
 
-        # Два рекуррентных слоя GRU с dropout между ними
         self.gru = nn.GRU(
-            input_size=self.d_step, hidden_size=hidden_dim,
-            num_layers=n_layers, batch_first=True,
-            dropout=dropout if n_layers > 1 else 0,
+            input_size=d_step,
+            hidden_size=hidden_dim,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
         )
-        self.dropout = nn.Dropout(p=dropout)
-        # Полносвязная голова с промежуточным слоем
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 64),
+            nn.GELU(),
             nn.Dropout(p=dropout),
-            nn.Linear(32, n_quantiles),
+            nn.Linear(64, n_quantiles * horizon_h),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (batch, seq_len, d_step=10) — последовательность временных шагов
-           или (batch, 1, d_in=69) — legacy формат (авто-конвертируется)
+        x : (batch, seq_len, d_step)
+        возвращает : (batch, horizon_h, n_quantiles)
+
+        Residual-prior: к каждому квантилю каждого шага горизонта добавляется
+        последнее значение приоритетного канала (residual_idx). Это бесплатно
+        даёт сети AR(1)-приор; голова GRU обучается предсказывать только дельту.
         """
-        # Обратная совместимость: если пришёл legacy вектор (1, d_in), разворачиваем
-        if x.ndim == 3 and x.shape[1] == 1 and x.shape[2] > self.d_step:
-            r = x[:, 0, :60]                          # (batch, 60)
-            feats = x[:, 0, 60:66].unsqueeze(1).expand(-1, 60, -1)  # (batch, 60, 6)
-            x = torch.cat([r.unsqueeze(-1), feats], dim=-1)         # (batch, 60, 7)
-
-        out, _ = self.gru(x)                 # (batch, seq, hidden)
-        last = self.dropout(out[:, -1, :])   # (batch, hidden)
-        return self.head(last)               # (batch, n_quantiles)
+        out, _ = self.gru(x)                                 # (B, seq, hidden)
+        last = out[:, -1, :]                                  # (B, hidden)
+        delta = self.head(last)                               # (B, n_q*h)
+        delta = delta.view(-1, self.horizon_h, self.n_quantiles)
+        anchor = x[:, -1, self.residual_idx].view(-1, 1, 1)  # (B, 1, 1)
+        return delta + anchor
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. Dataset для временного ряда
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Dataset для прямого многошагового обучения
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TimeSeriesDataset(Dataset):
     """
-    Скользящее окно длиной w_input для обучения GRU.
-    Каждый пример: (X, y), где
-      X — последовательность из w_input шагов, каждый с 7 признаками:
-          [R̃_t, sin_h, cos_h, sin_d, cos_d, sin_m, cos_m]
-      y — следующее значение нормализованного остатка
+    Скользящее окно для прямого многошагового обучения.
+
+    Каждый пример (X, y):
+      X : (w_input, d_step) — признаки на каждом шаге окна
+      y : (horizon_h,)      — следующие horizon_h нормализованных значений целевой переменной
+
+    По умолчанию (при `extra_channel=None`) используется одна канал-целевая
+    переменная + 6 тригонометрических признаков → d_step = 7.
+    Если `extra_channel` передан, он добавляется как второй сигнал → d_step = 8.
+    Это позволяет одновременно подавать модель и raw cpu_norm, и residual_norm.
     """
+
     def __init__(
         self,
-        residual_norm: np.ndarray,   # R̃_t (нормализованный остаток)
-        timestamps: np.ndarray,      # unix timestamps для временных признаков
-        phi: np.ndarray,             # φ_t (3, n) — сохранён для совместимости, не используется
+        target: np.ndarray,                # цель и одновременно главный сигнальный канал
+        timestamps: np.ndarray,
+        phi: Optional[np.ndarray] = None,  # сохранён для совместимости, не используется
         w_input: int = 60,
+        horizon_h: int = 3,
+        extra_channel: Optional[np.ndarray] = None,
     ):
-        self.residual = residual_norm.astype(np.float32)
-        self.timestamps = timestamps
-        self.w = w_input
-        self.n = len(residual_norm) - w_input
+        self.target = np.asarray(target, dtype=np.float32)
+        self.timestamps = np.asarray(timestamps, dtype=np.int64)
+        self.w = int(w_input)
+        self.h = int(horizon_h)
+        self.n = max(0, len(self.target) - self.w - self.h + 1)
+        if extra_channel is not None:
+            extra = np.asarray(extra_channel, dtype=np.float32)
+            if len(extra) != len(self.target):
+                raise ValueError(
+                    f"extra_channel length {len(extra)} != target length {len(self.target)}"
+                )
+            self.extra = extra
+        else:
+            self.extra = None
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        window_r = self.residual[idx: idx + self.w]     # (w,)
-        window_ts = self.timestamps[idx: idx + self.w]
+        w, h = self.w, self.h
+        x_window = self.target[idx: idx + w]
+        ts_window = self.timestamps[idx: idx + w]
+        y_future = self.target[idx + w: idx + w + h]
 
-        # Тригонометрические временные признаки для каждого шага окна
-        hours = (window_ts % 86400) / 3600.0
-        dows = ((window_ts // 86400) % 7).astype(float)
-        minutes = ((window_ts % 3600) / 60.0)
+        # Тригонометрические временные признаки
+        hours = (ts_window % 86400) / 3600.0
+        dows = ((ts_window // 86400) % 7).astype(np.float32)
+        minutes = (ts_window % 3600) / 60.0
 
-        sin_h = np.sin(2 * np.pi * hours / 24).reshape(-1, 1)
-        cos_h = np.cos(2 * np.pi * hours / 24).reshape(-1, 1)
-        sin_d = np.sin(2 * np.pi * dows / 7).reshape(-1, 1)
-        cos_d = np.cos(2 * np.pi * dows / 7).reshape(-1, 1)
-        sin_m = np.sin(2 * np.pi * minutes / 60).reshape(-1, 1)
-        cos_m = np.cos(2 * np.pi * minutes / 60).reshape(-1, 1)
+        sin_h = np.sin(2 * np.pi * hours / 24.0)
+        cos_h = np.cos(2 * np.pi * hours / 24.0)
+        sin_d = np.sin(2 * np.pi * dows / 7.0)
+        cos_d = np.cos(2 * np.pi * dows / 7.0)
+        sin_m = np.sin(2 * np.pi * minutes / 60.0)
+        cos_m = np.cos(2 * np.pi * minutes / 60.0)
 
-        # (w, 7): residual + 6 time features
-        X = np.concatenate([
-            window_r.reshape(-1, 1),
-            sin_h, cos_h, sin_d, cos_d, sin_m, cos_m,
-        ], axis=1)  # (w, 7)
+        if self.extra is not None:
+            extra_window = self.extra[idx: idx + w]
+            X = np.stack(
+                [x_window, extra_window, sin_h, cos_h, sin_d, cos_d, sin_m, cos_m], axis=1
+            ).astype(np.float32)
+        else:
+            X = np.stack(
+                [x_window, sin_h, cos_h, sin_d, cos_d, sin_m, cos_m], axis=1
+            ).astype(np.float32)
+        return torch.from_numpy(X), torch.from_numpy(y_future.astype(np.float32))
 
-        y = self.residual[idx + self.w]
-        return torch.FloatTensor(X), torch.FloatTensor([y])
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. Тренер модели
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Тренер
+# ─────────────────────────────────────────────────────────────────────────────
 
 class GRUTrainer:
     """
-    Инкапсулирует процедуру обучения GRUQuantileNet (параграф 4.1).
+    Обучение GRUQuantileNet (прямой многошаговый режим).
 
-    Гиперпараметры (таблица 4.2):
-      lr=0.001, lr_decay=0.99, grad_clip=1.0,
-      max_epochs=100, patience=10
+    Особенности:
+      • CUDA по умолчанию, если доступна;
+      • ранняя остановка при patience > 0;
+      • восстановление лучших весов на CPU;
+      • cosine-warm-restart планировщик скорости обучения.
     """
+
     def __init__(
         self,
-        model: GRUQuantileNet,
+        model: nn.Module,
         quantiles: List[float] = (0.025, 0.5, 0.975),
-        lr: float = 0.001,
+        lr: float = 1e-3,
         lr_decay: float = 0.99,
         grad_clip: float = 1.0,
-        max_epochs: int = 100,
-        patience: int = 10,
-        batch_size: int = 32,
+        max_epochs: int = 60,
+        patience: int = 8,
+        batch_size: int = 64,
         device: Optional[str] = None,
+        weight_decay: float = 1e-4,
     ):
         self.model = model
         self.quantiles = list(quantiles)
-        self.lr = lr
-        self.lr_decay = lr_decay
-        self.grad_clip = grad_clip
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.batch_size = batch_size
-        self.device = torch.device(
-            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.model.to(self.device)
+        self.lr = float(lr)
+        self.lr_decay = float(lr_decay)
+        self.grad_clip = float(grad_clip)
+        self.max_epochs = int(max_epochs)
+        self.patience = int(patience)
+        self.batch_size = int(batch_size)
 
-        self.criterion = QuantileLoss(self.quantiles)
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            self.optimizer, gamma=lr_decay
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model.to(self.device)
+        self.criterion = QuantileLoss(self.quantiles).to(self.device)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=self.lr, weight_decay=weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=10, T_mult=2
         )
 
         self.train_losses: List[float] = []
@@ -211,89 +266,122 @@ class GRUTrainer:
         self.epochs_no_improve: int = 0
         self.stopped_epoch: int = 0
 
+    # ─────────────────────────────────────────────────────────────────────
     def fit(
         self,
-        train_dataset: TimeSeriesDataset,
-        val_dataset: TimeSeriesDataset,
+        train_dataset: Dataset,
+        val_dataset: Dataset,
         epoch_callback=None,
     ) -> None:
-        """
-        Обучение с ранней остановкой (patience=10 эпох).
-        Восстанавливает лучшие веса по val_loss.
-        """
+        """Обучает модель на train_dataset, валидируется на val_dataset."""
+        if len(train_dataset) == 0:
+            logger.warning("Empty train dataset; skipping fit.")
+            return
+
+        pin = self.device.type == "cuda"
         train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=False,
+            pin_memory=pin,
+            num_workers=0,
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=self.batch_size, shuffle=False
+            val_dataset,
+            batch_size=max(self.batch_size, 128),
+            shuffle=False,
+            pin_memory=pin,
+            num_workers=0,
         )
 
         for epoch in range(1, self.max_epochs + 1):
-            # ── Обучение ──────────────────────────────────────────────────
+            # — Тренировка —
             self.model.train()
-            epoch_loss = 0.0
-            for X_batch, y_batch in train_loader:
-                X_batch = X_batch.to(self.device)
-                y_batch = y_batch.squeeze(1).to(self.device)
-                self.optimizer.zero_grad()
-                preds = self.model(X_batch)
-                loss = self.criterion(preds, y_batch)
+            running = 0.0
+            n_batches = 0
+            for X, y in train_loader:
+                X = X.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
+                self.optimizer.zero_grad(set_to_none=True)
+                preds = self.model(X)                  # (B, h, n_q)
+                loss = self.criterion(preds, y)
                 loss.backward()
-                # Обрезка нормы градиента (grad_clip=1.0)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
-                epoch_loss += loss.item()
-            train_loss = epoch_loss / len(train_loader)
+                running += float(loss.item())
+                n_batches += 1
+            train_loss = running / max(n_batches, 1)
             self.train_losses.append(train_loss)
 
-            # ── Валидация ────────────────────────────────────────────────
-            self.model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for X_batch, y_batch in val_loader:
-                    X_batch = X_batch.to(self.device)
-                    y_batch = y_batch.squeeze(1).to(self.device)
-                    preds = self.model(X_batch)
-                    val_loss += self.criterion(preds, y_batch).item()
-            val_loss /= max(len(val_loader), 1)
+            # — Валидация —
+            val_loss = self._evaluate(val_loader)
             self.val_losses.append(val_loss)
+            self.scheduler.step()
 
-            # ── Ранняя остановка ──────────────────────────────────────────
-            if val_loss < self.best_val_loss:
+            improved = val_loss + 1e-6 < self.best_val_loss
+            if improved:
                 self.best_val_loss = val_loss
-                self.best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                self.best_state = {
+                    k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+                }
                 self.epochs_no_improve = 0
             else:
                 self.epochs_no_improve += 1
 
-            self.scheduler.step()
-
-            logger.info(
-                f"Epoch {epoch:3d} | train_loss={train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} | no_improve={self.epochs_no_improve}"
-            )
-
-            if epoch_callback:
+            if epoch_callback is not None:
                 epoch_callback(epoch, train_loss, val_loss, self.best_val_loss)
 
-            if self.patience and self.epochs_no_improve >= self.patience:
+            logger.info(
+                "epoch %3d  train=%.5f  val=%.5f  best=%.5f  no_improve=%d",
+                epoch, train_loss, val_loss, self.best_val_loss, self.epochs_no_improve,
+            )
+
+            if self.patience > 0 and self.epochs_no_improve >= self.patience:
                 self.stopped_epoch = epoch
-                logger.info(f"Early stopping at epoch {epoch}.")
+                logger.info("Early stopping at epoch %d.", epoch)
                 break
 
-        # Восстановление лучшего состояния
         if self.best_state is not None:
             self.model.load_state_dict(self.best_state)
+        self.model.to(self.device)
 
+    # ─────────────────────────────────────────────────────────────────────
+    def _evaluate(self, loader: DataLoader) -> float:
+        if len(loader.dataset) == 0:
+            return float("inf")
+        self.model.eval()
+        total = 0.0
+        n = 0
+        with torch.no_grad():
+            for X, y in loader:
+                X = X.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
+                preds = self.model(X)
+                total += float(self.criterion(preds, y).item())
+                n += 1
+        return total / max(n, 1)
+
+    # ─────────────────────────────────────────────────────────────────────
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        Прогноз для одного входного вектора.
-        X: (1, 69) → возвращает (3,) — три квантиля нормализованного остатка.
+        Прогноз для одной (или нескольких) последовательностей.
+
+        X может иметь форму:
+          (w, d_step)            → одна последовательность
+          (1, w, d_step)         → одна последовательность
+          (B, w, d_step)         → батч
+
+        Возвращает numpy-массив формы (horizon_h, n_quantiles) для одиночного входа
+        или (B, horizon_h, n_quantiles) для батча.
         """
         self.model.eval()
         with torch.no_grad():
-            t = torch.FloatTensor(X).to(self.device)
+            t = torch.as_tensor(X, dtype=torch.float32, device=self.device)
             if t.ndim == 2:
-                t = t.unsqueeze(0)  # (1, 1, 69)
-            out = self.model(t)     # (1, 3)
-            return out.cpu().numpy().flatten()
+                t = t.unsqueeze(0)
+                squeeze = True
+            else:
+                squeeze = False
+            out = self.model(t).cpu().numpy()        # (B, h, n_q)
+            return out[0] if squeeze else out

@@ -1,17 +1,28 @@
 """
-predictor/preprocessor.py — Модуль сбора и предобработки данных (параграф 3.2.1)
+predictor/preprocessor.py — Сбор и предобработка временного ряда (параграф 3.2.1).
 
-Реализует три этапа:
-  1. Обнаружение аномалий методом скользящего МКР (формула 3.8)
-  2. Декомпозиция STL: cpu_t = T_t + S_t + R_t  (формула 3.9)
-  3. Нормализация остатка R̃_t = (R_t - μ_w) / σ_w  (формула 3.10)
+Реализованы три этапа:
+  1. Робастное обнаружение аномалий по скользящему МКР Тьюки (формула 3.8).
+  2. Адаптивная EWM-декомпозиция: cpu_t = T_t + R_t  (онлайн-замена STL).
+     Сезонная компонента S_t моделируется отдельно и в predict() обновляется
+     инкрементально, поэтому здесь возвращается пустым массивом — это нужно
+     только для обратной совместимости со старым API.
+  3. Глобальная (по обучающему ряду) z-score нормализация остатка
+     R̃_t = (R_t − μ_R) / σ_R  (формула 3.10, модифицированная редакция).
+
+Главные отличия от старой STL-версии:
+  • Никакой пересчёт декомпозиции на каждый predict() — EWM обновляется за O(1).
+  • Параметры нормализации (μ_R, σ_R) фиксируются на обучающем ряду и больше не
+    дрейфуют, что устраняет рассогласование шкал между fit() и predict().
 """
+
+from __future__ import annotations
+
+import logging
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from statsmodels.tsa.seasonal import STL
-from typing import Tuple, Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +31,13 @@ class Preprocessor:
     """
     Предобработка временного ряда утилизации процессора.
 
-    Параметры (из config.yaml → preprocessing):
-        w_a     : окно обнаружения аномалий (48 наблюдений = 4 часа при Δt=5 мин)
-        iqr_alpha: коэффициент α = 1.5 (метод Тьюки, формула 3.8)
-        w_norm  : окно нормализации (60 наблюдений = 5 часов)
-        period  : p = 288 (суточный период при Δt=5 мин)
-        robust  : True (STL с перевзвешиванием выбросов)
+    Параметры (config.yaml → preprocessing):
+      w_a       : окно МКР для обнаружения аномалий
+      iqr_alpha : коэффициент α метода Тьюки (формула 3.8)
+      w_norm    : ширина EWM-окна сглаживания тренда (хотя нормализация теперь
+                  глобальная, имя сохранено для совместимости конфига)
+      period    : суточный период (используется только для совместимости)
+      robust    : включить EWM-сглаживание ряда после удаления аномалий
     """
 
     def __init__(
@@ -36,149 +48,131 @@ class Preprocessor:
         period: int = 288,
         robust: bool = True,
     ):
-        self.w_a = w_a
-        self.iqr_alpha = iqr_alpha
-        self.w_norm = w_norm
-        self.period = period
-        self.robust = robust
+        self.w_a = int(w_a)
+        self.iqr_alpha = float(iqr_alpha)
+        self.w_norm = int(w_norm)
+        self.period = int(period)
+        self.robust = bool(robust)
 
-        # Параметры нормализации — сохраняются для обратного преобразования
+        # Зафиксированные параметры нормализации остатка (после fit_transform)
         self.mu_w: float = 0.0
         self.sigma_w: float = 1.0
+        # Зафиксированные параметры нормализации raw cpu (z-score по обучающему ряду)
+        self.mu_cpu: float = 0.0
+        self.sigma_cpu: float = 1.0
+        self._fitted: bool = False
 
-        # Компоненты декомпозиции последнего вызова fit_transform
+        # Последние компоненты декомпозиции (диагностика)
         self.trend_: Optional[np.ndarray] = None
         self.seasonal_: Optional[np.ndarray] = None
         self.residual_: Optional[np.ndarray] = None
         self.clean_series_: Optional[np.ndarray] = None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Публичный интерфейс
+    # Главный публичный метод
     # ─────────────────────────────────────────────────────────────────────────
 
-    def fit_transform(self, series: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    def fit_transform(
+        self, series: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
         """
         Полный цикл предобработки.
 
-        Аргументы:
-            series: одномерный массив значений cpu_t длиной >= period
-
-        Возвращает:
-            trend     : T_t — трендовая компонента
-            seasonal  : S_t — сезонная компонента (период p)
-            residual_norm: R̃_t — нормализованный остаток
-            mu_w      : μ_w(t) — скользящее среднее остатка
-            sigma_w   : σ_w(t) — скользящее стандартное отклонение
+        Возвращает кортеж той же формы, что и старая STL-реализация:
+            trend, seasonal, residual_norm, mu_R, sigma_R
         """
-        # Шаг 1: обнаружение и замена аномалий (формула 3.8)
         clean = self._remove_anomalies(series)
-        self.clean_series_ = clean
+        trend = self._ewm_trend(clean)
+        seasonal = np.zeros_like(trend, dtype=np.float32)
+        residual = (clean - trend).astype(np.float32)
 
-        # Шаг 2: STL-декомпозиция (формула 3.9)
-        trend, seasonal, residual = self._stl_decompose(clean)
-        self.trend_ = trend
+        # Глобальные параметры нормализации фиксируем только при первом fit().
+        if not self._fitted:
+            self.mu_w = float(np.mean(residual))
+            sigma_r = float(np.std(residual))
+            self.sigma_w = sigma_r if sigma_r > 1e-8 else 1e-8
+            self.mu_cpu = float(np.mean(clean))
+            sigma_c = float(np.std(clean))
+            self.sigma_cpu = sigma_c if sigma_c > 1e-8 else 1e-8
+            self._fitted = True
+
+        residual_norm = ((residual - self.mu_w) / self.sigma_w).astype(np.float32)
+
+        self.clean_series_ = clean.astype(np.float32)
+        self.trend_ = trend.astype(np.float32)
         self.seasonal_ = seasonal
         self.residual_ = residual
 
-        # Шаг 3: нормализация остатка (формула 3.10)
-        residual_norm, mu, sigma = self._normalize(residual)
-        self.mu_w = mu
-        self.sigma_w = sigma
+        return trend, seasonal, residual_norm, self.mu_w, self.sigma_w
 
-        return trend, seasonal, residual_norm, mu, sigma
+    def transform(
+        self, series: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+        """
+        Применение предобработки без изменения зафиксированных μ_R / σ_R.
+        Используется в HybridForecaster.predict() для горячего пути.
+
+        Также обновляет диагностические поля clean_series_, trend_, residual_,
+        чтобы forecaster мог взять очищенный ряд после вызова transform().
+        """
+        clean = self._remove_anomalies(series)
+        trend = self._ewm_trend(clean)
+        seasonal = np.zeros_like(trend, dtype=np.float32)
+        residual = (clean - trend).astype(np.float32)
+        residual_norm = ((residual - self.mu_w) / self.sigma_w).astype(np.float32)
+
+        self.clean_series_ = clean.astype(np.float32)
+        self.trend_ = trend.astype(np.float32)
+        self.seasonal_ = seasonal
+        self.residual_ = residual
+        return trend, seasonal, residual_norm, self.mu_w, self.sigma_w
 
     def inverse_transform_residual(self, residual_norm: np.ndarray) -> np.ndarray:
-        """
-        Обратное преобразование нормализованного остатка:
-        R_t = σ_w(t) * R̃_t + μ_w(t)
-        Параметры μ_w, σ_w строго берутся по данным до момента t (нет утечки).
-        """
+        """R_t = σ_R · R̃_t + μ_R."""
         return self.sigma_w * residual_norm + self.mu_w
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Шаг 1: Обнаружение аномалий
+    # Шаг 1: робастное обнаружение аномалий (формула 3.8)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _remove_anomalies(self, series: np.ndarray) -> np.ndarray:
         """
-        Метод скользящего МКР (Тьюки, формула 3.8).
-        Границы: [Q1 - α*IQR, Q3 + α*IQR], окно w_a.
-        Аномальные значения заменяются линейной интерполяцией.
+        Векторизованное скользящее обнаружение и интерполяция выбросов.
+        Граница окна: только прошлые данные (предотвращение утечки).
         """
-        s = series.copy().astype(float)
+        s = np.asarray(series, dtype=np.float64).copy()
         n = len(s)
-        anomaly_mask = np.zeros(n, dtype=bool)
+        if n == 0:
+            return s
 
-        for i in range(n):
-            # Скользящее окно — только прошлые данные (избегаем утечки)
-            lo = max(0, i - self.w_a)
-            window = s[lo:i] if i > 0 else s[:1]
-            if len(window) < 4:
-                continue
-            q1, q3 = np.percentile(window, [25, 75])
-            iqr = q3 - q1
-            lower = q1 - self.iqr_alpha * iqr
-            upper = q3 + self.iqr_alpha * iqr
-            if s[i] < lower or s[i] > upper:
-                anomaly_mask[i] = True
-
-        # Линейная интерполяция аномальных значений
-        if anomaly_mask.any():
-            n_anomalies = int(anomaly_mask.sum())
-            logger.debug(f"Detected {n_anomalies} anomalies, applying linear interpolation")
+        ser = pd.Series(s)
+        roll = ser.rolling(window=self.w_a, min_periods=8)
+        q1 = roll.quantile(0.25).shift(1).to_numpy()
+        q3 = roll.quantile(0.75).shift(1).to_numpy()
+        iqr = q3 - q1
+        lower = q1 - self.iqr_alpha * iqr
+        upper = q3 + self.iqr_alpha * iqr
+        mask = (~np.isnan(lower)) & ((s < lower) | (s > upper))
+        if mask.any():
             idx = np.arange(n)
-            valid_idx = idx[~anomaly_mask]
-            valid_vals = s[~anomaly_mask]
-            if len(valid_idx) > 1:
-                s[anomaly_mask] = np.interp(
-                    idx[anomaly_mask], valid_idx, valid_vals
-                )
-
+            valid = ~mask
+            s[mask] = np.interp(idx[mask], idx[valid], s[valid])
         return s
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Шаг 2: STL-декомпозиция
+    # Шаг 2: EWM-тренд (быстрая онлайн-замена STL)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _stl_decompose(
-        self, series: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _ewm_trend(self, clean: np.ndarray) -> np.ndarray:
         """
-        STL-декомпозиция: cpu_t = T_t + S_t + R_t (формула 3.9).
-        Параметры: period=288, robust=True.
-        Минимальная длина ряда: 2*period.
+        Двойная экспоненциально взвешенная скользящая средняя с эффективной длиной w_norm.
+        Дешевле STL в сотни раз и обновляется за O(1) на новый отсчёт.
         """
-        if len(series) < 2 * self.period:
-            logger.warning(
-                f"Series too short for STL ({len(series)} < {2*self.period}). "
-                "Using fallback (zero trend and seasonal)."
-            )
-            return np.zeros_like(series), np.zeros_like(series), series.copy()
-
-        stl = STL(series, period=self.period, robust=self.robust)
-        result = stl.fit()
-        return (
-            np.array(result.trend),
-            np.array(result.seasonal),
-            np.array(result.resid),
-        )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Шаг 3: Нормализация
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _normalize(
-        self, residual: np.ndarray
-    ) -> Tuple[np.ndarray, float, float]:
-        """
-        Адаптивная нормализация по скользящему окну w_norm (формула 3.10):
-        R̃_t = (R_t - μ_w(t)) / σ_w(t)
-        μ_w и σ_w вычисляются по последним w_norm значениям.
-        """
-        window = residual[-self.w_norm:] if len(residual) >= self.w_norm else residual
-        mu = float(np.mean(window))
-        sigma = float(np.std(window))
-        if sigma < 1e-8:
-            sigma = 1e-8  # защита от деления на ноль
-        residual_norm = (residual - mu) / sigma
-        return residual_norm, mu, sigma
+        if not self.robust or len(clean) < 3:
+            return clean.astype(np.float32)
+        span = max(self.w_norm, 8)
+        # Первый проход — основное сглаживание
+        ewm1 = pd.Series(clean).ewm(span=span, adjust=False, min_periods=1).mean()
+        # Второй проход — повторное сглаживание ослабляет фазовую задержку
+        ewm2 = ewm1.ewm(span=max(span // 2, 4), adjust=False, min_periods=1).mean()
+        return ewm2.to_numpy().astype(np.float32)

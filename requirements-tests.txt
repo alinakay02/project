@@ -1,13 +1,23 @@
-# Минимальные зависимости для запуска ML-тестов (без Docker/K8s/Flask)
+# Минимальные зависимости для запуска ML-тестов (без Docker/K8s/Flask).
+#
+# ВНИМАНИЕ: pip установит CPU-сборку torch по умолчанию.
+# Сразу после `pip install -r requirements-tests.txt` ОБЯЗАТЕЛЬНО поставьте
+# GPU-сборку поверх:
+#
+#   CUDA 12.1:
+#     pip install --force-reinstall torch==2.1.2+cu121 \
+#         --index-url https://download.pytorch.org/whl/cu121
+#
+#   CUDA 11.8:
+#     pip install --force-reinstall torch==2.1.2+cu118 \
+#         --index-url https://download.pytorch.org/whl/cu118
+#
+# Проверка: python -c "import torch; print(torch.cuda.is_available())"
+# Подробности: см. RUN_TESTS_ON_ANOTHER_PC.md
 numpy==1.26.4
 scipy==1.13.0
 pandas==2.2.2
 statsmodels==0.14.2
-# torch==2.1.2        # CPU-версия
-# Для GPU установите отдельно:
-#   pip install torch==2.1.2+cu118 --index-url https://download.pytorch.org/whl/cu118
-# или для CUDA 12.1:
-#   pip install torch==2.1.2+cu121 --index-url https://download.pytorch.org/whl/cu121
 torch==2.1.2
 scikit-learn==1.4.2
 prophet==1.1.5
