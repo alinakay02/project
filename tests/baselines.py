@@ -25,7 +25,9 @@ class BaseForecaster:
 
 
 class SARIMAForecaster(BaseForecaster):
-    """SARIMA через statsmodels.SARIMAX с авто-подбором порядков по AIC."""
+    """SARIMA через statsmodels.SARIMAX."""
+
+    _PERIOD = 24  # сезонный период (288 → 24 для скорости)
 
     def __init__(self, horizon_h=3):
         self.horizon_h = horizon_h
@@ -34,10 +36,11 @@ class SARIMAForecaster(BaseForecaster):
     def fit(self, cpu, ts, phi):
         try:
             from statsmodels.tsa.statespace.sarimax import SARIMAX
-            # Подбираем простой SARIMA(1,1,1)(0,1,1,288)
-            model = SARIMAX(cpu, order=(1,1,1), seasonal_order=(0,1,1,288),
-                            enforce_stationarity=False, enforce_invertibility=False)
-            self._model_fit = model.fit(disp=False, maxiter=100)
+            model = SARIMAX(cpu, order=(1,1,1),
+                            seasonal_order=(0,1,1, self._PERIOD),
+                            enforce_stationarity=False,
+                            enforce_invertibility=False)
+            self._model_fit = model.fit(disp=False, maxiter=50)
         except Exception as e:
             logger.warning(f"SARIMA fit failed: {e}")
             self._model_fit = None
@@ -48,8 +51,10 @@ class SARIMAForecaster(BaseForecaster):
                    np.zeros(self.horizon_h), np.ones(self.horizon_h)
         try:
             from statsmodels.tsa.statespace.sarimax import SARIMAX
-            model = SARIMAX(cpu, order=(1,1,1), seasonal_order=(0,1,1,288),
-                            enforce_stationarity=False, enforce_invertibility=False)
+            model = SARIMAX(cpu, order=(1,1,1),
+                            seasonal_order=(0,1,1, self._PERIOD),
+                            enforce_stationarity=False,
+                            enforce_invertibility=False)
             fit = model.filter(self._model_fit.params)
             fc = fit.forecast(self.horizon_h)
             fc = np.clip(fc, 0, 1)
@@ -94,12 +99,15 @@ class ARIMAForecaster(BaseForecaster):
 
 
 class HoltWintersForecaster(BaseForecaster):
-    """Экспоненциальное сглаживание Хольта-Винтерса с суточной сезонностью."""
+    """Экспоненциальное сглаживание Хольта-Винтерса с сезонностью."""
 
-    def __init__(self, horizon_h=3, period=288, **kwargs):
+    def __init__(self, horizon_h=3, period=24, **kwargs):
         self.horizon_h = horizon_h
         self.period = period
         self._model_fit = None
+        self._alpha = None
+        self._beta = None
+        self._gamma = None
 
     def fit(self, cpu, ts, phi):
         try:
@@ -110,6 +118,9 @@ class HoltWintersForecaster(BaseForecaster):
                 initialization_method="estimated",
             )
             self._model_fit = model.fit(optimized=True, use_brute=False)
+            self._alpha = self._model_fit.params['smoothing_level']
+            self._beta = self._model_fit.params['smoothing_trend']
+            self._gamma = self._model_fit.params['smoothing_seasonal']
         except Exception as e:
             logger.warning(f"Holt-Winters fit failed: {e}")
             self._model_fit = None
@@ -119,7 +130,20 @@ class HoltWintersForecaster(BaseForecaster):
             fb = np.full(self.horizon_h, float(np.mean(cpu[-60:])))
             return fb, fb * 0.8, fb * 1.2
         try:
-            fc = self._model_fit.forecast(self.horizon_h)
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            model = ExponentialSmoothing(
+                cpu, trend="add", seasonal="add",
+                seasonal_periods=self.period,
+                initialization_method="estimated",
+            )
+            fit = model.fit(
+                smoothing_level=self._alpha,
+                smoothing_trend=self._beta,
+                smoothing_seasonal=self._gamma,
+                optimized=False,
+                use_brute=False,
+            )
+            fc = fit.forecast(self.horizon_h)
             fc = np.clip(fc, 0, 1)
             std_est = float(np.std(cpu[-288:])) * 1.5
             return fc, np.clip(fc - 1.96 * std_est, 0, 1), np.clip(fc + 1.96 * std_est, 0, 1)

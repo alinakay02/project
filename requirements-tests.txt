@@ -1,26 +1,29 @@
-# Минимальные зависимости для запуска ML-тестов (без Docker/K8s/Flask).
+# Minimal dependencies for ML tests (no Docker/K8s/Flask).
 #
-# ВНИМАНИЕ: pip установит CPU-сборку torch по умолчанию.
-# Сразу после `pip install -r requirements-tests.txt` ОБЯЗАТЕЛЬНО поставьте
-# GPU-сборку поверх:
+# Versions are loose so pip can pick a wheel matching the local Python
+# (3.10..3.13 are all supported by these libraries via different minor
+# versions).
+#
+# IMPORTANT: pip installs the CPU build of torch by default.
+# After `pip install -r requirements-tests.txt`, you MUST install the GPU
+# build on top:
 #
 #   CUDA 12.1:
-#     pip install --force-reinstall torch==2.1.2+cu121 \
+#     pip install --force-reinstall "torch>=2.1,<2.5" ^
 #         --index-url https://download.pytorch.org/whl/cu121
 #
 #   CUDA 11.8:
-#     pip install --force-reinstall torch==2.1.2+cu118 \
+#     pip install --force-reinstall "torch>=2.1,<2.5" ^
 #         --index-url https://download.pytorch.org/whl/cu118
 #
-# Проверка: python -c "import torch; print(torch.cuda.is_available())"
-# Подробности: см. RUN_TESTS_ON_ANOTHER_PC.md
-numpy==1.26.4
-scipy==1.13.0
-pandas==2.2.2
-statsmodels==0.14.2
-torch==2.1.2
-scikit-learn==1.4.2
-prophet==1.1.5
-pytest==8.2.0
-pytest-html==4.1.1
-pyyaml==6.0.1
+# Verify: python -c "import torch; print(torch.cuda.is_available())"
+# See RUN_TESTS_ON_ANOTHER_PC.md for details.
+numpy>=1.26,<3.0
+scipy>=1.11,<2.0
+pandas>=2.1,<3.0
+statsmodels>=0.14,<0.16
+torch>=2.1,<2.5
+scikit-learn>=1.4,<2.0
+pytest>=8.0,<9.0
+pytest-html>=4.0,<5.0
+pyyaml>=6.0,<7.0

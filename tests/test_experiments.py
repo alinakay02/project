@@ -21,6 +21,7 @@ import gc
 import math
 import time
 import logging
+import traceback
 import warnings
 import numpy as np
 import pytest
@@ -53,6 +54,7 @@ from tests.metrics import (
     compute_sla_violations, compute_avg_utilization, compute_scale_ops,
     print_forecast_metrics, print_mgmt_metrics,
 )
+from predictor.config import CFG_PREPROCESSOR, CFG_FORECASTER, CFG_DECISION
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -75,14 +77,6 @@ if not _CUDA_OK:
     warnings.warn(msg, stacklevel=2)
 
 SEEDS = [42, 137, 256]
-
-CFG_PREPROCESSOR = dict(w_a=48, iqr_alpha=1.5, w_norm=60, period=288, robust=True)
-CFG_FORECASTER   = dict(n_T=60, n_cycles=7, period=288, horizon_h=3, w_input=60,
-                        quantiles=[0.025, 0.5, 0.975], hidden_dim=96, dropout=0.20,
-                        lr=1e-3, lr_decay=0.99, grad_clip=1.0,
-                        max_epochs=60, patience=8, batch_size=64)
-CFG_DECISION     = dict(cpu_target=0.70, epsilon=0.05, r_min=2, r_max_cluster=8,
-                        tau=4, beta=0.3, max_conn=100, conn_reserve=10, pool_size=5)
 N_OBS_SYNTHETIC  = 4_320
 
 
@@ -116,14 +110,25 @@ def fit_with_cache(fc, cpu, ts, phi, seed, tag):
     if os.path.exists(path):
         try:
             fc.load_model(path)
+            print(f"      [cache HIT] {tag}_seed{seed}.pt", flush=True)
             return
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"      [cache MISS] {tag}_seed{seed}.pt unreadable: {e}", flush=True)
     fc.fit(cpu, ts, phi)
     try:
         fc.save_model(path)
-    except Exception:
-        pass
+        print(f"      [cache SAVE] {tag}_seed{seed}.pt", flush=True)
+    except Exception as e:
+        print(f"      [cache SAVE FAIL] {e}", flush=True)
+
+
+def _now() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def _print_progress(tag: str, step: int, total: int, message: str) -> None:
+    pct = 100.0 * step / max(total, 1)
+    print(f"[{_now()}] [{tag}] [{step:>3d}/{total:>3d}  {pct:5.1f}%] {message}", flush=True)
 
 
 def run_forecast_experiment(forecaster, cpu_train, cpu_test, ts_train, ts_test,
@@ -159,39 +164,92 @@ ALL_METHODS = {
 
 
 def _run_all_methods_on_dataset(dataset_name, cpu, ts, phi):
-    """Прогоняет все методы на одном датасете, возвращает dict {method: metrics}."""
+    """
+    Прогоняет все методы на одном датасете, возвращает dict {method: metrics}.
+
+    Логирует прогресс по каждой паре (method, seed): сколько шагов сделано из
+    общего числа, сколько занял шаг, и любые исключения. Если один шаг падает,
+    остальные продолжают выполняться, а в финальной таблице у этого метода
+    будет пометка ERROR.
+    """
     n_tr = int(len(cpu) * 0.70)
     n_vl = int(len(cpu) * 0.15)
     cpu_train, cpu_test = cpu[:n_tr], cpu[n_tr + n_vl:]
     ts_train, ts_test = ts[:n_tr], ts[n_tr + n_vl:]
     phi_train, phi_test = phi[:, :n_tr], phi[:, n_tr + n_vl:]
 
+    total_steps = len(ALL_METHODS) * len(SEEDS)
+    print(
+        f"\n[{_now()}] [{dataset_name}] >>> старт: "
+        f"{len(ALL_METHODS)} методов × {len(SEEDS)} seeds = {total_steps} шагов "
+        f"(n={len(cpu)}, train={n_tr}, test={len(cpu_test)})",
+        flush=True,
+    )
+    dataset_t0 = time.time()
+    step = 0
     results = {}
 
     for method_name, factory in ALL_METHODS.items():
         maes, rmses, mapes, coverages = [], [], [], []
+        method_t0 = time.time()
+        method_errors = 0
 
         for seed in SEEDS:
+            step += 1
+            _print_progress(
+                dataset_name, step, total_steps,
+                f"START  method='{method_name}' seed={seed}",
+            )
+            seed_t0 = time.time()
             torch_seed(seed)
             gc.collect()
 
-            if method_name == "Разработанный метод":
-                pp, fc, dm = build_proposed_method(seed)
-                fit_with_cache(fc, cpu_train, ts_train, phi_train, seed, f"{dataset_name}_proposed")
-                forecaster = fc
-            else:
-                forecaster = factory(seed)
-                forecaster.fit(cpu_train, ts_train, phi_train)
+            try:
+                if method_name == "Разработанный метод":
+                    pp, fc, dm = build_proposed_method(seed)
+                    fit_with_cache(
+                        fc, cpu_train, ts_train, phi_train, seed,
+                        f"{dataset_name}_proposed",
+                    )
+                    forecaster = fc
+                else:
+                    forecaster = factory(seed)
+                    forecaster.fit(cpu_train, ts_train, phi_train)
 
-            r = run_forecast_experiment(forecaster, cpu_train, cpu_test,
-                                        ts_train, ts_test, phi_train, phi_test)
+                r = run_forecast_experiment(
+                    forecaster, cpu_train, cpu_test,
+                    ts_train, ts_test, phi_train, phi_test,
+                )
 
-            if len(r["y_true"]) > 0:
-                maes.append(compute_mae(r["y_true"], r["y_pred"]))
-                rmses.append(compute_rmse(r["y_true"], r["y_pred"]))
-                mapes.append(compute_mape(r["y_true"], r["y_pred"]))
-                coverages.append(compute_coverage(r["y_true"], r["y_lower"], r["y_upper"]))
+                if len(r["y_true"]) > 0:
+                    mae = compute_mae(r["y_true"], r["y_pred"])
+                    rmse = compute_rmse(r["y_true"], r["y_pred"])
+                    mape = compute_mape(r["y_true"], r["y_pred"])
+                    cov = compute_coverage(r["y_true"], r["y_lower"], r["y_upper"])
+                    maes.append(mae); rmses.append(rmse)
+                    mapes.append(mape); coverages.append(cov)
+                    _print_progress(
+                        dataset_name, step, total_steps,
+                        f"DONE   method='{method_name}' seed={seed} "
+                        f"MAE={mae:.4f} COV={cov:.1f}% "
+                        f"({time.time() - seed_t0:.1f}s)",
+                    )
+                else:
+                    _print_progress(
+                        dataset_name, step, total_steps,
+                        f"WARN   method='{method_name}' seed={seed}: "
+                        f"empty prediction set",
+                    )
+            except Exception as e:
+                method_errors += 1
+                tb = traceback.format_exc(limit=4)
+                print(
+                    f"[{_now()}] [{dataset_name}] [ERROR] method='{method_name}' "
+                    f"seed={seed}: {type(e).__name__}: {e}\n{tb}",
+                    flush=True,
+                )
 
+        method_elapsed = time.time() - method_t0
         if maes:
             results[method_name] = {
                 "mae": np.mean(maes), "mae_std": np.std(maes),
@@ -199,13 +257,27 @@ def _run_all_methods_on_dataset(dataset_name, cpu, ts, phi):
                 "mape": np.mean(mapes), "mape_std": np.std(mapes),
                 "coverage": np.mean(coverages), "coverage_std": np.std(coverages),
             }
-            print(f"\n[METRIC] COMPARE: {dataset_name} | {method_name} | "
-                  f"MAE={np.mean(maes):.4f}±{np.std(maes):.4f} | "
-                  f"RMSE={np.mean(rmses):.4f}±{np.std(rmses):.4f} | "
-                  f"MAPE={np.mean(mapes):.2f}±{np.std(mapes):.2f}% | "
-                  f"COVERAGE={np.mean(coverages):.1f}±{np.std(coverages):.1f}%",
-                  flush=True)
+            print(
+                f"\n[METRIC] COMPARE: {dataset_name} | {method_name} | "
+                f"MAE={np.mean(maes):.4f}±{np.std(maes):.4f} | "
+                f"RMSE={np.mean(rmses):.4f}±{np.std(rmses):.4f} | "
+                f"MAPE={np.mean(mapes):.2f}±{np.std(mapes):.2f}% | "
+                f"COVERAGE={np.mean(coverages):.1f}±{np.std(coverages):.1f}% "
+                f"| seeds_ok={len(maes)}/{len(SEEDS)} "
+                f"| total={method_elapsed:.1f}s",
+                flush=True,
+            )
+        else:
+            print(
+                f"\n[METRIC] COMPARE: {dataset_name} | {method_name} | "
+                f"FAILED ({method_errors}/{len(SEEDS)} seeds errored, total={method_elapsed:.1f}s)",
+                flush=True,
+            )
 
+    print(
+        f"\n[{_now()}] [{dataset_name}] <<< готово за {time.time() - dataset_t0:.1f}с",
+        flush=True,
+    )
     return results
 
 
@@ -260,20 +332,57 @@ class TestHorizonDependence:
         n_tr = int(len(cpu) * 0.70)
         n_vl = int(len(cpu) * 0.15)
         maes = []
+        total = len(SEEDS)
+        tag = f"HORIZON h={h}"
+        print(
+            f"\n[{_now()}] [{tag}] >>> старт: {total} seeds на Alibaba",
+            flush=True,
+        )
+        block_t0 = time.time()
 
-        for seed in SEEDS:
-            torch_seed(seed)
-            pp, fc, _ = build_proposed_method(seed, horizon_h=h)
-            fit_with_cache(fc, cpu[:n_tr], ts[:n_tr], phi[:, :n_tr], seed, f"horizon_h{h}")
-            r = run_forecast_experiment(
-                fc, cpu[:n_tr], cpu[n_tr + n_vl:],
-                ts[:n_tr], ts[n_tr + n_vl:],
-                phi[:, :n_tr], phi[:, n_tr + n_vl:],
-                horizon_h=h)
-            maes.append(compute_mae(r["y_true"], r["y_pred"]))
+        for step, seed in enumerate(SEEDS, 1):
+            seed_t0 = time.time()
+            _print_progress(tag, step, total, f"START seed={seed}")
+            try:
+                torch_seed(seed)
+                pp, fc, _ = build_proposed_method(seed, horizon_h=h)
+                fit_with_cache(
+                    fc, cpu[:n_tr], ts[:n_tr], phi[:, :n_tr], seed, f"horizon_h{h}",
+                )
+                r = run_forecast_experiment(
+                    fc, cpu[:n_tr], cpu[n_tr + n_vl:],
+                    ts[:n_tr], ts[n_tr + n_vl:],
+                    phi[:, :n_tr], phi[:, n_tr + n_vl:],
+                    horizon_h=h,
+                )
+                mae = compute_mae(r["y_true"], r["y_pred"])
+                maes.append(mae)
+                _print_progress(
+                    tag, step, total,
+                    f"DONE  seed={seed} MAE={mae:.4f} ({time.time() - seed_t0:.1f}s)",
+                )
+            except Exception as e:
+                tb = traceback.format_exc(limit=4)
+                print(
+                    f"[{_now()}] [{tag}] [ERROR] seed={seed}: "
+                    f"{type(e).__name__}: {e}\n{tb}",
+                    flush=True,
+                )
 
-        print(f"\n[METRIC] HORIZON: h={h} | MAE={np.mean(maes):.4f}±{np.std(maes):.4f}",
-              flush=True)
+        if maes:
+            print(
+                f"\n[METRIC] HORIZON: h={h} | "
+                f"MAE={np.mean(maes):.4f}±{np.std(maes):.4f} "
+                f"| seeds_ok={len(maes)}/{total} "
+                f"| total={time.time() - block_t0:.1f}s",
+                flush=True,
+            )
+        else:
+            print(
+                f"\n[METRIC] HORIZON: h={h} | FAILED "
+                f"(0/{total} seeds successful, total={time.time() - block_t0:.1f}s)",
+                flush=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -286,23 +395,43 @@ class TestComputationTime:
     def test_iteration_time(self):
         cpu, ts, phi = load_alibaba_trace()
         n_tr = int(len(cpu) * 0.70)
+        N_ITERS = 20
+        tag = "TIMING"
 
+        print(
+            f"\n[{_now()}] [{tag}] >>> старт: 1 fit + {N_ITERS} итераций predict",
+            flush=True,
+        )
+        fit_t0 = time.time()
         pp, fc, dm = build_proposed_method(42)
         fit_with_cache(fc, cpu[:n_tr], ts[:n_tr], phi[:, :n_tr], 42, "timing")
+        print(
+            f"[{_now()}] [{tag}] fit готов за {time.time() - fit_t0:.1f}с",
+            flush=True,
+        )
 
         times_ms = []
-        for i in range(20):
+        for i in range(N_ITERS):
             window_end = n_tr + i
             t0 = time.perf_counter()
             _, _, resid_norm, mu, sigma = pp.fit_transform(cpu[:window_end])
-            cpu_hat, q_lo, q_hi = fc.predict(cpu[:window_end], ts[:window_end], phi[:, :window_end])
+            cpu_hat, q_lo, q_hi = fc.predict(
+                cpu[:window_end], ts[:window_end], phi[:, :window_end]
+            )
             dm.step(float(q_hi[0]), float(q_lo[0]))
             elapsed_ms = (time.perf_counter() - t0) * 1000
             times_ms.append(elapsed_ms)
+            _print_progress(
+                tag, i + 1, N_ITERS,
+                f"iter={i + 1} elapsed={elapsed_ms:.1f}ms",
+            )
 
-        mean_ms = np.mean(times_ms)
-        std_ms = np.std(times_ms)
+        mean_ms = float(np.mean(times_ms))
+        std_ms = float(np.std(times_ms))
         pct_of_dt = mean_ms / (5 * 60 * 1000) * 100
 
-        print(f"\n[METRIC] TIMING: Среднее={mean_ms:.1f}мс ± {std_ms:.1f}мс | "
-              f"Доля от Δt={pct_of_dt:.3f}%", flush=True)
+        print(
+            f"\n[METRIC] TIMING: Среднее={mean_ms:.1f}мс ± {std_ms:.1f}мс | "
+            f"Доля от Δt={pct_of_dt:.3f}%",
+            flush=True,
+        )

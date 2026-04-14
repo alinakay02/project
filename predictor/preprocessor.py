@@ -3,17 +3,9 @@ predictor/preprocessor.py — Сбор и предобработка време�
 
 Реализованы три этапа:
   1. Робастное обнаружение аномалий по скользящему МКР Тьюки (формула 3.8).
-  2. Адаптивная EWM-декомпозиция: cpu_t = T_t + R_t  (онлайн-замена STL).
-     Сезонная компонента S_t моделируется отдельно и в predict() обновляется
-     инкрементально, поэтому здесь возвращается пустым массивом — это нужно
-     только для обратной совместимости со старым API.
+  2. STL-декомпозиция: cpu_t = T_t + S_t + R_t  (формула 3.9).
   3. Глобальная (по обучающему ряду) z-score нормализация остатка
-     R̃_t = (R_t − μ_R) / σ_R  (формула 3.10, модифицированная редакция).
-
-Главные отличия от старой STL-версии:
-  • Никакой пересчёт декомпозиции на каждый predict() — EWM обновляется за O(1).
-  • Параметры нормализации (μ_R, σ_R) фиксируются на обучающем ряду и больше не
-    дрейфуют, что устраняет рассогласование шкал между fit() и predict().
+     R̃_t = (R_t − μ_R) / σ_R  (формула 3.10).
 """
 
 from __future__ import annotations
@@ -34,10 +26,9 @@ class Preprocessor:
     Параметры (config.yaml → preprocessing):
       w_a       : окно МКР для обнаружения аномалий
       iqr_alpha : коэффициент α метода Тьюки (формула 3.8)
-      w_norm    : ширина EWM-окна сглаживания тренда (хотя нормализация теперь
-                  глобальная, имя сохранено для совместимости конфига)
-      period    : суточный период (используется только для совместимости)
-      robust    : включить EWM-сглаживание ряда после удаления аномалий
+      w_norm    : ширина окна сезонного сглаживания STL (нечётное ≥ 7)
+      period    : суточный период (288 = 24ч / 5мин)
+      robust    : использовать робастный STL (устойчивость к выбросам)
     """
 
     def __init__(
@@ -78,13 +69,11 @@ class Preprocessor:
         """
         Полный цикл предобработки.
 
-        Возвращает кортеж той же формы, что и старая STL-реализация:
+        Возвращает:
             trend, seasonal, residual_norm, mu_R, sigma_R
         """
         clean = self._remove_anomalies(series)
-        trend = self._ewm_trend(clean)
-        seasonal = np.zeros_like(trend, dtype=np.float32)
-        residual = (clean - trend).astype(np.float32)
+        trend, seasonal, residual = self._stl_decompose(clean)
 
         # Глобальные параметры нормализации фиксируем только при первом fit().
         if not self._fitted:
@@ -99,7 +88,7 @@ class Preprocessor:
         residual_norm = ((residual - self.mu_w) / self.sigma_w).astype(np.float32)
 
         self.clean_series_ = clean.astype(np.float32)
-        self.trend_ = trend.astype(np.float32)
+        self.trend_ = trend
         self.seasonal_ = seasonal
         self.residual_ = residual
 
@@ -110,19 +99,14 @@ class Preprocessor:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
         """
         Применение предобработки без изменения зафиксированных μ_R / σ_R.
-        Используется в HybridForecaster.predict() для горячего пути.
-
-        Также обновляет диагностические поля clean_series_, trend_, residual_,
-        чтобы forecaster мог взять очищенный ряд после вызова transform().
+        Используется в HybridForecaster.predict().
         """
         clean = self._remove_anomalies(series)
-        trend = self._ewm_trend(clean)
-        seasonal = np.zeros_like(trend, dtype=np.float32)
-        residual = (clean - trend).astype(np.float32)
+        trend, seasonal, residual = self._stl_decompose(clean)
         residual_norm = ((residual - self.mu_w) / self.sigma_w).astype(np.float32)
 
         self.clean_series_ = clean.astype(np.float32)
-        self.trend_ = trend.astype(np.float32)
+        self.trend_ = trend
         self.seasonal_ = seasonal
         self.residual_ = residual
         return trend, seasonal, residual_norm, self.mu_w, self.sigma_w
@@ -160,19 +144,46 @@ class Preprocessor:
         return s
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Шаг 2: EWM-тренд (быстрая онлайн-замена STL)
+    # Шаг 2: STL-декомпозиция (формула 3.9)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _ewm_trend(self, clean: np.ndarray) -> np.ndarray:
+    def _stl_decompose(
+        self, clean: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Двойная экспоненциально взвешенная скользящая средняя с эффективной длиной w_norm.
-        Дешевле STL в сотни раз и обновляется за O(1) на новый отсчёт.
+        STL-декомпозиция: cpu_t = T_t + S_t + R_t.
+
+        Параметры сезонного сглаживателя берутся из self.w_norm
+        (должно быть нечётное ≥ 7; корректируется автоматически).
         """
-        if not self.robust or len(clean) < 3:
-            return clean.astype(np.float32)
-        span = max(self.w_norm, 8)
-        # Первый проход — основное сглаживание
-        ewm1 = pd.Series(clean).ewm(span=span, adjust=False, min_periods=1).mean()
-        # Второй проход — повторное сглаживание ослабляет фазовую задержку
-        ewm2 = ewm1.ewm(span=max(span // 2, 4), adjust=False, min_periods=1).mean()
-        return ewm2.to_numpy().astype(np.float32)
+        n = len(clean)
+        # Если данных меньше 2 полных периодов — fallback на скользящее среднее
+        if n < 2 * self.period:
+            trend = (
+                pd.Series(clean)
+                .rolling(window=min(n, self.period), center=True, min_periods=1)
+                .mean()
+                .to_numpy()
+            )
+            seasonal = np.zeros_like(trend, dtype=np.float32)
+            residual = (clean - trend).astype(np.float32)
+            return trend.astype(np.float32), seasonal, residual
+
+        from statsmodels.tsa.seasonal import STL
+
+        seasonal_window = max(self.w_norm, 7)
+        if seasonal_window % 2 == 0:
+            seasonal_window += 1
+
+        result = STL(
+            clean,
+            period=self.period,
+            seasonal=seasonal_window,
+            robust=self.robust,
+        ).fit()
+
+        return (
+            result.trend.astype(np.float32),
+            result.seasonal.astype(np.float32),
+            result.resid.astype(np.float32),
+        )

@@ -1,14 +1,11 @@
 """
-predictor/forecaster.py — Гибридная модель прогнозирования (параграф 3.2.2, обновлённая редакция).
+predictor/forecaster.py — Гибридная модель прогнозирования (параграф 3.2.2).
 
 Состав метода:
-  1. Робастная EWM-декомпозиция: cpu_t = T_t + R_t (см. preprocessor.py).
-  2. Прямой многошаговый квантильный GRU: за один проход выдаёт h*n_q значений
-     нормализованного остатка R̃_{t+1..t+h}.
-  3. Аналитическая экстраполяция тренда T̂_{t+k} двойным EWM (без linregress).
-  4. Конформная калибровка ширины доверительного интервала по hold-out выборке —
+  1. STL-декомпозиция: cpu_t = T_t + S_t + R_t (см. preprocessor.py).
+  2. Прямой многошаговый квантильный GRU: за один проход выдаёт h*n_q значений.
+  3. Конформная калибровка ширины доверительного интервала по hold-out выборке —
      гарантирует эмпирическое покрытие ≈ (1−ε) даже при недокалиброванных квантилях.
-  5. Горячий путь predict() — O(w·h), без пересчёта декомпозиции на полном ряду.
 
 Метод сохраняет публичный интерфейс HybridForecaster: fit / predict / save_model /
 load_model — поэтому контроллер и тесты используют его без изменений.
@@ -31,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 # Версия архитектуры; при её смене старые .pt-кэши автоматически отбрасываются.
-MODEL_VERSION = 5
+MODEL_VERSION = 7
 
 
 class HybridForecaster:
@@ -82,7 +79,7 @@ class HybridForecaster:
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
 
-        # 8 признаков: cpu_norm + ewm_residual_norm + 6 тригонометрических временных
+        # 8 признаков: cpu_norm + stl_residual_norm + 6 тр��гонометрических временных
         self.net = GRUQuantileNet(
             d_step=8,
             hidden_dim=hidden_dim,
@@ -148,12 +145,12 @@ class HybridForecaster:
 
         logger.info("Fit on %d observations (h=%d, w=%d).", n, self.horizon_h, self.w_input)
 
-        # 1. Предобработка
+        # 1. Предобработка (STL-декомпозиция)
         self.preprocessor._fitted = False
         trend, _, resid_norm, _, _ = self.preprocessor.fit_transform(cpu_series)
 
         # Главный канал и цель — z-score(cpu) (модель предсказывает cpu_norm[t+k]).
-        # Дополнительный канал — нормализованный EWM-остаток (стационарный сигнал).
+        # Дополнительный канал — нормализованный STL-остаток (стационарный сигнал).
         # Архитектурный AR-приор (residual_idx=0) добавит cpu_norm[t-1] к каждому
         # выходу — модель учится предсказывать дельту от persistence.
         mu_cpu = float(self.preprocessor.mu_cpu)
@@ -373,7 +370,7 @@ class HybridForecaster:
         """
         Возвращает (cpu_hat, q_lower, q_upper), длина = horizon_h.
 
-        Горячий путь: O(w·h) операций без пересчёта STL и без перенормировки.
+        STL считается на скользящем окне (~3 периода), а не на всём ряду.
         """
         if not self._is_trained:
             raise RuntimeError("Model is not trained. Call fit() first.")
@@ -386,16 +383,26 @@ class HybridForecaster:
                 f"Need at least w_input+1={self.w_input+1} points, got {n}."
             )
 
-        # 1. Дешёвая EWM-декомпозиция (зафиксированные μ/σ)
-        _, _, resid_norm, _, _ = self.preprocessor.transform(cpu_series)
+        # 1. STL-декомпозиция на скользящем окне (не на всём ряду).
+        #    GRU использует только последние w_input значений, поэтому
+        #    достаточно декомпозировать последние ~3 суточных периода.
+        w = self.w_input
+        stl_window = max(3 * self.preprocessor.period, w * 4)
+        if n > stl_window:
+            cpu_tail = cpu_series[-stl_window:]
+            ts_tail = timestamps[-stl_window:]
+        else:
+            cpu_tail = cpu_series
+            ts_tail = timestamps
+
+        _, _, resid_norm, _, _ = self.preprocessor.transform(cpu_tail)
         clean = self.preprocessor.clean_series_
         mu_cpu = float(self.preprocessor.mu_cpu)
         sigma_cpu = float(self.preprocessor.sigma_cpu)
         cpu_norm = ((clean - mu_cpu) / sigma_cpu).astype(np.float32)
 
         # 2. Признаки последнего окна (w, 8): main = cpu_norm, extra = resid_norm
-        w = self.w_input
-        X = self._stack_features(cpu_norm[-w:], resid_norm[-w:], timestamps[-w:])
+        X = self._stack_features(cpu_norm[-w:], resid_norm[-w:], ts_tail[-w:])
 
         # 3. Один forward GRU → (h, n_q) в нормализованных координатах cpu
         out = self.trainer.predict(X)                             # (h, n_q)

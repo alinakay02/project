@@ -126,12 +126,7 @@ def _real_forecast(history_values, horizon_h, period=288, n_T=60, n_cycles=7):
     return hat, lower, upper
 
 # ── Глобальная обученная модель (подгружается после обучения) ───────────────
-# Параметры по умолчанию (совпадают с config.yaml / test_experiments.py)
-CFG_PREPROCESSOR = dict(w_a=48, iqr_alpha=1.5, w_norm=60, period=288, robust=True)
-CFG_FORECASTER   = dict(n_T=60, n_cycles=7, period=288, horizon_h=3, w_input=60,
-                        quantiles=[0.025, 0.5, 0.975], hidden_dim=64, dropout=0.10,
-                        lr=0.001, lr_decay=0.99, grad_clip=1.0,
-                        max_epochs=100, patience=0, batch_size=32)
+from predictor.config import CFG_PREPROCESSOR, CFG_FORECASTER
 
 _trained_forecaster = None
 _forecaster_lock = threading.Lock()
@@ -149,13 +144,8 @@ def _load_latest_model():
     try:
         from predictor.preprocessor import Preprocessor
         from predictor.forecaster import HybridForecaster
-        pp = Preprocessor(**{k: _cfg.get("preprocessing", {}).get(k, v)
-                             for k, v in CFG_PREPROCESSOR.items()})
-        fc = HybridForecaster(preprocessor=pp, **{
-            k: _cfg.get("model", {}).get(k,
-               _cfg.get("timeseries", {}).get(k,
-               _cfg.get("preprocessing", {}).get(k, v)))
-            for k, v in CFG_FORECASTER.items()})
+        pp = Preprocessor(**CFG_PREPROCESSOR)
+        fc = HybridForecaster(preprocessor=pp, **CFG_FORECASTER)
         fc.load_model(latest)
         with _forecaster_lock:
             _trained_forecaster = fc
@@ -563,13 +553,8 @@ def api_training_start():
             logger.info(f"Training on dataset '{dataset_id}': {len(cpu_series)} observations")
 
             # ── 2. Создание моделей ──────────────────────────────────────
-            pp = Preprocessor(**{k: _cfg.get("preprocessing", {}).get(k, v)
-                                 for k, v in CFG_PREPROCESSOR.items()})
-            fc_cfg = {k: _cfg.get("model", {}).get(k,
-                        _cfg.get("timeseries", {}).get(k,
-                        _cfg.get("preprocessing", {}).get(k, v)))
-                      for k, v in CFG_FORECASTER.items()}
-            forecaster = HybridForecaster(preprocessor=pp, **fc_cfg)
+            pp = Preprocessor(**CFG_PREPROCESSOR)
+            forecaster = HybridForecaster(preprocessor=pp, **CFG_FORECASTER)
 
             # ── 3. Callback для обновления прогресса по эпохам ────────
             def on_epoch(epoch, train_loss, val_loss, best_val):
