@@ -7,18 +7,36 @@
 
 ## 0. Схема терминалов
 
-Для полного цикла тестирования нужны **7 терминалов**.
-Ниже — краткая карта, подробности по каждому далее.
+С актуальной версией манифестов (`Service` типа `NodePort` +
+`extraPortMappings` в `kind-config.yaml`) **port-forward больше не нужен**.
+Сервисы доступны напрямую по localhost.
+
+Для полного цикла тестирования нужны **4 терминала**:
 
 | #  | Что работает                  | venv? | Закрывать? |
 |----|-------------------------------|-------|------------|
 | T1 | kubectl, docker, тесты pytest | да    | нет        |
-| T2 | port-forward webapp 8080:80   | нет   | нет        |
-| T3 | port-forward api 5001:5001    | нет   | нет        |
-| T4 | port-forward prometheus 9090  | нет   | нет        |
-| T5 | npm run dev (фронтенд)        | нет   | нет        |
-| T6 | locust master                 | да    | нет        |
-| T7 | locust worker(ы)              | да    | нет        |
+| T2 | npm run dev (фронтенд)        | нет   | нет        |
+| T3 | locust master                 | да    | нет        |
+| T4 | locust worker(ы)              | да    | нет        |
+
+Прямые адреса сервисов после `kubectl apply -f k8s/manifests.yaml`:
+
+| URL | Назначение |
+|---|---|
+| http://localhost:8080 | webapp — нагрузочные маршруты (`/compute/*`, `/db/*`, `/memory/*`) |
+| http://localhost:5001 | webapp-api — REST + SSE (`/api/status`, `/api/stream`, ...) |
+| http://localhost:9090 | Prometheus — UI/PromQL |
+
+Если кластер создан со старой версией `kind-config.yaml` (без
+`extraPortMappings`), можно либо пересоздать его, либо подключать сервисы
+через `kubectl port-forward` как раньше:
+
+```powershell
+kubectl port-forward service/webapp     8080:80
+kubectl port-forward service/webapp-api 5001:5001
+kubectl port-forward service/prometheus 9090:9090
+```
 
 ---
 
@@ -111,28 +129,24 @@ webapp-xxxxx                  1/1     Running   0          2m
 webapp-yyyyy                  1/1     Running   0          2m
 ```
 
-### 1.5. Запустить port-forward (три отдельных терминала)
+### 1.5. Проверить что сервисы доступны напрямую
 
-**Терминал T2:**
+С актуальным `kind-config.yaml` сервисы доступны сразу после применения
+манифестов — port-forward не нужен:
+
 ```powershell
-kubectl port-forward service/webapp 8080:80
+curl http://localhost:8080/health      # webapp: {"status":"ok"}
+curl http://localhost:5001/api/status  # API: содержит "mode":"real"
+curl http://localhost:9090/-/ready     # Prometheus: Prometheus is Ready.
 ```
 
-**Терминал T3:**
-```powershell
-kubectl port-forward deployment/webapp 5001:5001
-```
-
-**Терминал T4:**
-```powershell
-kubectl port-forward service/prometheus 9090:9090
-```
-
-Каждый терминал будет висеть — это нормально. Не закрывай их.
+Если какой-то из сервисов не отвечает — убедись что под `Running`
+(`kubectl get pods`) и что NodePort объявлен в манифесте (`kubectl get
+svc`). Старая схема с `kubectl port-forward` тоже работает как fallback.
 
 ### 1.6. Запустить фронтенд
 
-**Терминал T5:**
+**Терминал T2:**
 ```powershell
 cd C:\diplom\project\frontend
 npm run dev
@@ -238,7 +252,7 @@ kubectl get pods -w
 
 Цель: убедиться, что стенд стабилен до начала серьёзной нагрузки.
 
-**Терминал T6** (нужен venv):
+**Терминал T3** (нужен venv):
 
 ```powershell
 cd C:\diplom\project
@@ -259,7 +273,7 @@ locust -f locust/locustfile.py --host http://localhost:8080 --headless --users 1
 
 Distributed mode: 1 мастер + 4 воркера.
 
-**Терминал T6** — мастер:
+**Терминал T3** — мастер:
 
 ```powershell
 cd C:\diplom\project
@@ -268,7 +282,7 @@ venv\Scripts\activate
 locust -f locust/locustfile.py --host http://localhost:8080 --master --expect-workers=4
 ```
 
-**Терминал T7** — запустить 4 воркера (одной командой):
+**Терминал T4** — запустить 4 воркера (одной командой):
 
 ```powershell
 cd C:\diplom\project
@@ -297,13 +311,13 @@ Start-Process powershell -ArgumentList "-Command cd C:\diplom\project; venv\Scri
 
 Для 12 000 нужно 6 воркеров:
 
-**Терминал T6** — мастер:
+**Терминал T3** — мастер:
 
 ```powershell
 locust -f locust/locustfile.py --host http://localhost:8080 --master --expect-workers=6
 ```
 
-**Терминал T7** — 6 воркеров:
+**Терминал T4** — 6 воркеров:
 
 ```powershell
 for ($i=1; $i -le 6; $i++) { Start-Process powershell -ArgumentList "-Command cd C:\diplom\project; venv\Scripts\activate; locust -f locust/locustfile.py --worker --master-host=127.0.0.1" }
@@ -317,12 +331,12 @@ for ($i=1; $i -le 6; $i++) { Start-Process powershell -ArgumentList "-Command cd
 
 Если нужно запустить тест без UI и сохранить результаты:
 
-**Мастер (T6):**
+**Мастер (T3):**
 ```powershell
 locust -f locust/locustfile.py --host http://localhost:8080 --master --expect-workers=4 --headless --users 5000 --spawn-rate 100 --run-time 30m --csv results/locust_5000
 ```
 
-**Воркеры (T7):** аналогично п. 3.2.
+**Воркеры (T4):** аналогично п. 3.2.
 
 После завершения в `results/` появятся файлы:
 - `locust_5000_stats.csv` — общая статистика по эндпоинтам
@@ -601,13 +615,19 @@ kubectl describe pod <имя-пода>
 kubectl rollout restart deployment webapp
 ```
 
-### Port-forward отвалился
+### Сервисы перестали отвечать по localhost
 
-Просто перезапусти его в соответствующем терминале.
+С актуальной версией манифестов (NodePort + extraPortMappings) сервисы
+доступны напрямую и не должны «отваливаться». Если не отвечают:
+1. `kubectl get svc` — проверь что type=NodePort и nodePort прописан.
+2. `kubectl get pods` — все ли Running.
+3. Docker Desktop: проверь что контейнер kind запущен
+   (`docker ps | findstr kind`).
+Fallback — временный `kubectl port-forward` как раньше.
 
 ### Locust показывает 100% ошибок
 
-1. Проверь, что port-forward webapp работает: `curl http://localhost:8080/health`
+1. Проверь, что webapp отвечает: `curl http://localhost:8080/health`
 2. Проверь логи: `kubectl logs deployment/webapp --tail=20`
 3. Возможно, поды перегружены — подожди минуту и попробуй снова
 

@@ -177,8 +177,9 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import axios from 'axios'
+import { useApiStream } from '../composables/useApiStream'
 import {
   Chart as ChartJS, CategoryScale, LinearScale, PointElement,
   LineElement, BarElement, Title, Tooltip, Legend, Filler
@@ -466,6 +467,12 @@ const dailyRpsOptions = {
   plugins: { legend: { labels: { color: '#4a5568', font: { size: 11 } } } }
 }
 
+// SSE-подписка на статус: сервер шлёт push при каждом новом сэмпле.
+const { status: streamStatus } = useApiStream('/api/stream')
+watch(streamStatus, (snap) => { if (snap) status.value = snap })
+
+// История и состояние нагрузки всё ещё запрашиваются по таймеру —
+// они меняются реже и не стоят отдельного стрима.
 let timer = null
 async function fetchConfig() {
   try {
@@ -473,14 +480,12 @@ async function fetchConfig() {
     config.value = { ...config.value, ...data }
   } catch {}
 }
-async function poll() {
+async function pollSlow() {
   try {
-    const [s, h, l] = await Promise.all([
-      axios.get('/api/status'),
+    const [h, l] = await Promise.all([
       axios.get('/api/history?n=80'),
       axios.get('/api/load'),
     ])
-    status.value  = s.data
     history.value = h.data.history || []
     loadActive.value = l.data.running || false
     loadUsers.value = {
@@ -491,7 +496,7 @@ async function poll() {
     }
   } catch {}
 }
-onMounted(() => { fetchConfig(); poll(); timer = setInterval(poll, 5000) })
+onMounted(() => { fetchConfig(); pollSlow(); timer = setInterval(pollSlow, 5000) })
 onUnmounted(() => clearInterval(timer))
 </script>
 

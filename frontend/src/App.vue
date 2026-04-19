@@ -38,13 +38,18 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import axios from 'axios'
+import { computed, watch } from 'vue'
+import { useApiStream } from './composables/useApiStream'
 
-const iterations = ref(0)
-const replicas   = ref(2)
-const rMax       = ref(20)
-const saturation = ref(false)
+// Подписываемся на push-поток обновлений (SSE). Это заменяет прежний
+// setInterval(poll, 5000): фронтенд получает новый снапшот состояния
+// сразу, как только на сервере появляется новый сэмпл от поллера.
+const { status } = useApiStream('/api/stream')
+
+const iterations = computed(() => status.value?.iterations ?? 0)
+const replicas   = computed(() => status.value?.replicas?.current ?? 2)
+const rMax       = computed(() => status.value?.replicas?.r_max ?? 20)
+const saturation = computed(() => status.value?.replicas?.saturation ?? false)
 
 const statusClass = computed(() => {
   if (saturation.value) return 'status-dot--warn'
@@ -55,20 +60,6 @@ const statusText = computed(() => {
   if (saturation.value) return 'Насыщение ресурсов'
   return `${replicas.value} / ${rMax.value} реплик`
 })
-
-let timer = null
-async function poll() {
-  try {
-    const { data } = await axios.get('/api/status')
-    iterations.value = data.iterations || 0
-    replicas.value   = data.replicas?.current || 2
-    rMax.value       = data.replicas?.r_max || 20
-    saturation.value = data.replicas?.saturation || false
-  } catch {}
-}
-
-onMounted(() => { poll(); timer = setInterval(poll, 5000) })
-onUnmounted(() => clearInterval(timer))
 </script>
 
 <style>

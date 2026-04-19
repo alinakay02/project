@@ -1,6 +1,22 @@
 """
 app/api.py — REST API для веб-интерфейса экспериментального стенда (параграф 4.1)
 
+Режимы работы:
+  • real — подключение к Prometheus и Kubernetes API. Поллер каждые 5 секунд
+    забирает метрики из Prometheus (cpu, mem, rps, latency, errors, phi),
+    читает текущее число реплик из Kubernetes API, строит прогноз обученной
+    GRU-моделью (если доступна) и обновляет состояние. Используется при
+    запуске стенда вместе с кластером kind.
+  • demo — синтетический генератор с реалистичным сезонным паттерном.
+    Реагирует на POST /api/load. Используется, если Prometheus недоступен
+    или включён флаг DEMO_MODE=1.
+
+Выбор режима:
+  • Если переменная окружения DEMO_MODE=1 — принудительно demo.
+  • Иначе при старте пробуется соединение с Prometheus по URL из config.yaml
+    (prometheus.url). Если ответ 200 — включается real; иначе — demo.
+  • Текущий режим экспонируется в GET /api/status → "mode": "real"|"demo".
+
 Эндпоинты:
   GET  /api/status          — текущее состояние системы (m_t, r_cur, прогноз)
   GET  /api/history         — история метрик за последние N точек
@@ -22,11 +38,12 @@ import os
 import numpy as np
 import yaml
 from scipy.stats import linregress
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 from sqlalchemy import create_engine, func, desc
 from sqlalchemy.orm import sessionmaker
 from app.models import Base as ExpBase, ExperimentResult
+from controller.prometheus_collector import PrometheusCollector
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +178,99 @@ _engine = create_engine(_db_url, pool_pre_ping=True, pool_size=3)
 ExpBase.metadata.create_all(_engine)
 _Session = sessionmaker(bind=_engine)
 
+# ── Определение режима работы (real vs demo) ────────────────────────────────
+# DEMO_MODE=1 в окружении → форсированный demo. Иначе пробуем Prometheus.
+
+_FORCE_DEMO = os.environ.get("DEMO_MODE", "").strip() in ("1", "true", "True", "yes")
+_PROMETHEUS_URL = _cfg.get("prometheus", {}).get("url", "http://localhost:9090")
+_PROMQL_QUERIES = _cfg.get("prometheus", {}).get("queries", {})
+_K8S_NAMESPACE = _cfg.get("kubernetes", {}).get("namespace", "default")
+_K8S_DEPLOYMENT = _cfg.get("kubernetes", {}).get("deployment_name", "webapp")
+
+
+def _probe_prometheus(url: str, timeout: float = 3.0) -> bool:
+    """Пытается обратиться к /-/ready Prometheus. True — доступен."""
+    try:
+        import requests
+        r = requests.get(f"{url.rstrip('/')}/-/ready", timeout=timeout)
+        return r.status_code == 200
+    except Exception as e:
+        logger.info("Prometheus probe failed: %s (url=%s)", e, url)
+        return False
+
+
+def _build_k8s_apps_client():
+    """
+    Возвращает AppsV1Api или None. Пробует сначала in-cluster config, потом
+    ~/.kube/config (локальный kubeconfig, используется когда api.py запущен
+    вне кластера, например через port-forward).
+    """
+    try:
+        from kubernetes import client as k8s_client, config as k8s_config
+    except ImportError:
+        logger.info("kubernetes package not available; replicas will be estimated.")
+        return None
+    try:
+        k8s_config.load_incluster_config()
+        logger.info("Kubernetes in-cluster config loaded.")
+        return k8s_client.AppsV1Api()
+    except Exception:
+        pass
+    try:
+        k8s_config.load_kube_config()
+        logger.info("Kubernetes kubeconfig loaded (local mode).")
+        return k8s_client.AppsV1Api()
+    except Exception as e:
+        logger.info("Kubernetes config unavailable: %s", e)
+        return None
+
+
+# Попытка инициализации real-mode коннекторов
+_prometheus_collector = None
+_k8s_apps = None
+_mode = "demo"
+
+if not _FORCE_DEMO and _PROMQL_QUERIES and _probe_prometheus(_PROMETHEUS_URL):
+    try:
+        _prometheus_collector = PrometheusCollector(
+            prometheus_url=_PROMETHEUS_URL,
+            queries=_PROMQL_QUERIES,
+        )
+        _k8s_apps = _build_k8s_apps_client()
+        _mode = "real"
+        logger.info(
+            "API started in REAL mode: Prometheus=%s, K8s=%s",
+            _PROMETHEUS_URL, "available" if _k8s_apps else "unavailable",
+        )
+    except Exception as e:
+        logger.warning("Failed to init real-mode collectors: %s. Falling back to demo.", e)
+        _prometheus_collector = None
+        _k8s_apps = None
+        _mode = "demo"
+else:
+    if _FORCE_DEMO:
+        logger.info("API started in DEMO mode (DEMO_MODE=1).")
+    else:
+        logger.info(
+            "Prometheus unreachable at %s; API started in DEMO mode.",
+            _PROMETHEUS_URL,
+        )
+
+
+def _get_current_replicas(default_val: int = 2) -> int:
+    """Читает spec.replicas из Kubernetes Deployment, fallback — default_val."""
+    if _k8s_apps is None:
+        return default_val
+    try:
+        dep = _k8s_apps.read_namespaced_deployment(
+            name=_K8S_DEPLOYMENT, namespace=_K8S_NAMESPACE,
+        )
+        return int(dep.spec.replicas or default_val)
+    except Exception as e:
+        logger.debug("K8s read replicas failed: %s", e)
+        return default_val
+
+
 # ── Глобальное хранилище состояния ───────────────────────────────────────────
 # (в production — Redis или база данных)
 _state = {
@@ -176,6 +286,7 @@ _state = {
     "history": [],          # список точек {ts, cpu, mem, rps, lat, err, r_cur}
     "hourly_stats": {},     # ключ "HH" → {cpu_sum, cpu_max, rps_sum, rps_max, count}
     "comparison": None,
+    "mode": _mode,          # "real" | "demo" — видно фронтенду через /api/status
 }
 _state_lock = threading.Lock()
 
@@ -190,7 +301,169 @@ def get_state() -> dict:
         return dict(_state)
 
 
-# ── Имитационный генератор данных (для демонстрации без реального Prometheus) ─
+# ── Общая пост-обработка одного сэмпла (используется и real-, и demo-поллерами) ─
+def _apply_sample(
+    cpu: float, mem: float, rps: float, lat: float, err: float,
+    phi,
+    r_cur: int,
+    action: str,
+    saturation: bool,
+    t_iter: int,
+    prev_cpu_hat,
+    prev_rps_hat,
+) -> tuple:
+    """
+    Общая post-обработка измерения: строит прогноз по обученной GRU (или fallback),
+    обновляет глобальное состояние _state (включая history и hourly_stats).
+    Возвращает (new_prev_cpu_hat, new_prev_rps_hat) для следующей итерации.
+    """
+    with _config_lock:
+        horizon_h = _runtime_config.get("horizon_h", 3)
+
+    point = {
+        "cpu_t": round(float(cpu), 4),
+        "mem_t": round(float(mem), 4),
+        "rps_t": round(max(float(rps), 0.0), 1),
+        "lat_t": round(float(lat), 1),
+        "err_t": round(float(err), 5),
+        "phi":   [round(float(p), 3) for p in phi],
+        "r_cur": int(r_cur),
+        "action": action,
+        "saturation": bool(saturation),
+        "timestamp": int(time.time()),
+        "iterations": int(t_iter),
+    }
+
+    # ── Прогноз ───────────────────────────────────────────────────────────
+    with _state_lock:
+        hist = list(_state["history"])
+    cpu_hist = [h["cpu"] for h in hist] + [point["cpu_t"]]
+    rps_hist = [h["rps"] for h in hist] + [point["rps_t"]]
+
+    cpu_hat, cpu_lower, cpu_upper = None, None, None
+
+    with _forecaster_lock:
+        fc_model = _trained_forecaster
+    if fc_model is not None and len(cpu_hist) >= fc_model.w_input + 10:
+        try:
+            ts_arr = np.array([h["ts"] for h in hist] + [point["timestamp"]])
+            phi_arr = np.array(
+                [h.get("phi", [0.33, 0.33, 0.34]) for h in hist] + [list(phi)]
+            ).T
+            cpu_arr = np.array(cpu_hist)
+            c_hat, c_lo, c_hi = fc_model.predict(cpu_arr, ts_arr, phi_arr)
+            cpu_hat = [round(float(v), 4) for v in c_hat]
+            cpu_lower = [round(float(v), 4) for v in c_lo]
+            cpu_upper = [round(float(v), 4) for v in c_hi]
+        except Exception as e:
+            logger.debug("GRU forecast failed, using fallback: %s", e)
+
+    if cpu_hat is None:
+        cpu_hat, cpu_lower, cpu_upper = _real_forecast(cpu_hist, horizon_h)
+
+    rps_hat, rps_lower, rps_upper = _real_forecast(rps_hist, horizon_h)
+
+    point["forecast"] = {
+        "cpu_hat": cpu_hat, "q_lower": cpu_lower, "q_upper": cpu_upper,
+        "rps_hat": rps_hat, "rps_lower": rps_lower, "rps_upper": rps_upper,
+    }
+
+    # ── Обновляем глобальное состояние ─────────────────────────────────────
+    with _state_lock:
+        _state.update(point)
+        _state["history"].append({
+            "ts":    point["timestamp"],
+            "cpu":   point["cpu_t"],
+            "cpu_pred": prev_cpu_hat,
+            "mem":   point["mem_t"],
+            "rps":   point["rps_t"],
+            "rps_pred": prev_rps_hat,
+            "lat":   point["lat_t"],
+            "err":   point["err_t"],
+            "r_cur": point["r_cur"],
+            "phi":   list(point["phi"]),
+        })
+        if len(_state["history"]) > 500:
+            _state["history"] = _state["history"][-500:]
+
+        hour_key = time.strftime("%H")
+        hs = _state["hourly_stats"]
+        if hour_key not in hs:
+            hs[hour_key] = {"cpu_sum": 0, "cpu_max": 0,
+                            "rps_sum": 0, "rps_max": 0,
+                            "cpu_pred_sum": 0, "rps_pred_sum": 0,
+                            "lat_sum": 0, "err_sum": 0, "count": 0}
+        bucket = hs[hour_key]
+        bucket["cpu_sum"] += point["cpu_t"]
+        bucket["cpu_max"] = max(bucket["cpu_max"], point["cpu_t"])
+        bucket["rps_sum"] += point["rps_t"]
+        bucket["rps_max"] = max(bucket["rps_max"], point["rps_t"])
+        bucket["lat_sum"] += point["lat_t"]
+        bucket["err_sum"] += point["err_t"]
+        if prev_cpu_hat is not None:
+            bucket["cpu_pred_sum"] = bucket.get("cpu_pred_sum", 0) + float(prev_cpu_hat)
+        if prev_rps_hat is not None:
+            bucket["rps_pred_sum"] = bucket.get("rps_pred_sum", 0) + float(prev_rps_hat)
+        bucket["count"] += 1
+
+    new_prev_cpu = cpu_hat[0] if cpu_hat else None
+    new_prev_rps = rps_hat[0] if rps_hat else None
+    return new_prev_cpu, new_prev_rps
+
+
+# ── Real-поллер (Prometheus + Kubernetes) ───────────────────────────────────
+def _real_poller():
+    """
+    Опрашивает Prometheus каждые 5 секунд, берёт текущее число реплик из
+    Kubernetes API и обновляет глобальное состояние. Используется, когда
+    api.py подключён к реальному кластеру.
+    """
+    logger.info("Real-mode poller started (Prometheus + K8s).")
+    t = 0
+    prev_cpu_hat = None
+    prev_rps_hat = None
+    prev_replicas = _get_current_replicas(
+        default_val=_runtime_config.get("r_min", 2)
+    )
+
+    while True:
+        try:
+            m_t, phi_t = _prometheus_collector.collect()
+            cpu = float(np.clip(m_t[0], 0.0, 1.0))
+            mem = float(np.clip(m_t[1], 0.0, 1.0))
+            rps = float(max(m_t[2], 0.0))
+            lat = float(max(m_t[3], 0.0))
+            err = float(np.clip(m_t[4], 0.0, 1.0))
+            phi = [float(p) for p in phi_t.tolist()]
+
+            # Текущее число реплик читаем из Kubernetes
+            r_cur = _get_current_replicas(default_val=prev_replicas)
+
+            if r_cur > prev_replicas:
+                action = "scale_up"
+            elif r_cur < prev_replicas:
+                action = "scale_down"
+            else:
+                action = "no_change"
+
+            r_max = _runtime_config.get("r_max_cluster", 20)
+            saturation = r_cur >= r_max
+
+            prev_cpu_hat, prev_rps_hat = _apply_sample(
+                cpu, mem, rps, lat, err, phi,
+                r_cur=r_cur, action=action, saturation=saturation,
+                t_iter=t,
+                prev_cpu_hat=prev_cpu_hat, prev_rps_hat=prev_rps_hat,
+            )
+            prev_replicas = r_cur
+        except Exception as e:
+            logger.warning("Real poller iteration failed: %s", e)
+
+        t += 1
+        time.sleep(5)
+
+
+# ── Имитационный генератор данных (для демонстрации без Prometheus) ─────────
 def _demo_generator():
     """Генерирует реалистичный ряд cpu_t для демо-режима.
 
@@ -201,10 +474,9 @@ def _demo_generator():
     Конфигурация берётся из _runtime_config (cpu_target, r_min, r_max_cluster).
     """
     t = 0
-    prev_cpu_hat = None   # 1-step-ahead CPU прогноз с предыдущей итерации
-    prev_rps_hat = None   # 1-step-ahead RPS прогноз с предыдущей итерации
+    prev_cpu_hat = None
+    prev_rps_hat = None
     while True:
-        # ── Считываем текущее состояние нагрузки ──────────────────────
         with _state_lock:
             load = dict(_state["load"])
 
@@ -214,31 +486,22 @@ def _demo_generator():
         u3 = load.get("users_class3", 0)
         total_users = u1 + u2 + u3
 
-        # ── Считываем конфигурацию ────────────────────────────────────
         with _config_lock:
             cpu_target = _runtime_config.get("cpu_target", 0.70)
             r_min = _runtime_config.get("r_min", 2)
             r_max = _runtime_config.get("r_max_cluster", 20)
-            horizon_h = _runtime_config.get("horizon_h", 3)
 
-        # ── Базовый сезонный сигнал ───────────────────────────────────
         seasonal = 0.20 * math.sin(2 * math.pi * t / 288)
         base_cpu = 0.35 + seasonal
         noise = 0.02 * (2 * float(np.random.rand()) - 1)
 
         if load_running and total_users > 0:
-            # Нагрузка активна — CPU растёт пропорционально пользователям
-            # При 3000 суммарных пользователей добавляется ~0.45 к CPU
             load_factor = min(total_users / 3000.0, 1.0)
             cpu = base_cpu + load_factor * 0.45 + noise
-            # Φ — реальное соотношение классов
             phi = [u1 / total_users, u2 / total_users, u3 / total_users]
-            # RPS: ~1 запрос/сек на пользователя (Locust wait_time 0.5–1.5с)
             rps = total_users * 1.0 + float(np.random.randn()) * total_users * 0.02
-            # Память тоже растёт под нагрузкой
             mem = 0.30 + 0.05 * math.sin(2 * math.pi * t / 144) + load_factor * 0.25
         else:
-            # Фоновый режим — плавная синусоида
             cpu = base_cpu + noise
             phase = (t // 120) % 3
             phi = [0.15, 0.15, 0.15]
@@ -253,7 +516,6 @@ def _demo_generator():
 
         r_cur = max(r_min, min(r_max, math.ceil(cpu / cpu_target)))
 
-        # Определяем действие масштабирования
         with _state_lock:
             prev_r = _state.get("r_cur", r_min)
         if r_cur > prev_r:
@@ -263,115 +525,38 @@ def _demo_generator():
         else:
             action = "no_change"
 
-        point = {
-            "cpu_t": round(cpu, 4),
-            "mem_t": round(mem, 4),
-            "rps_t": round(max(rps, 0), 1),
-            "lat_t": round(lat, 1),
-            "err_t": round(err, 5),
-            "phi":   [round(p, 3) for p in phi],
-            "r_cur": r_cur,
-            "action": action,
-            "saturation": r_cur >= r_max,
-            "timestamp": int(time.time()),
-            "iterations": t,
-        }
-        # ── Прогноз ───────────────────────────────────────────────────────
-        with _state_lock:
-            hist = list(_state["history"])
-        cpu_hist = [h["cpu"] for h in hist] + [round(cpu, 4)]
-        rps_hist = [h["rps"] for h in hist] + [round(max(rps, 0), 1)]
-
-        cpu_hat, cpu_lower, cpu_upper = None, None, None
-
-        # Пытаемся использовать обученную GRU-модель
-        with _forecaster_lock:
-            fc_model = _trained_forecaster
-        if fc_model is not None and len(cpu_hist) >= fc_model.w_input + 10:
-            try:
-                ts_arr = np.array([h["ts"] for h in hist] + [int(time.time())])
-                phi_arr = np.array([h.get("phi", [0.33, 0.33, 0.34]) for h in hist] + [phi]).T
-                cpu_arr = np.array(cpu_hist)
-                c_hat, c_lo, c_hi = fc_model.predict(cpu_arr, ts_arr, phi_arr)
-                cpu_hat = [round(float(v), 4) for v in c_hat]
-                cpu_lower = [round(float(v), 4) for v in c_lo]
-                cpu_upper = [round(float(v), 4) for v in c_hi]
-            except Exception as e:
-                logger.debug(f"GRU forecast failed, using fallback: {e}")
-
-        # Fallback — линейная экстраполяция
-        if cpu_hat is None:
-            cpu_hat, cpu_lower, cpu_upper = _real_forecast(cpu_hist, horizon_h)
-
-        rps_hat, rps_lower, rps_upper = _real_forecast(rps_hist, horizon_h)
-
-        point["forecast"] = {
-            "cpu_hat": cpu_hat, "q_lower": cpu_lower, "q_upper": cpu_upper,
-            "rps_hat": rps_hat, "rps_lower": rps_lower, "rps_upper": rps_upper,
-        }
-
-        with _state_lock:
-            _state.update(point)
-            _state["history"].append({
-                "ts":    point["timestamp"],
-                "cpu":   point["cpu_t"],
-                "cpu_pred": prev_cpu_hat,       # что модель предсказывала для этой точки
-                "mem":   point["mem_t"],
-                "rps":   point["rps_t"],
-                "rps_pred": prev_rps_hat,       # что модель предсказывала для этой точки
-                "lat":   point["lat_t"],
-                "err":   point["err_t"],
-                "r_cur": point["r_cur"],
-                "phi":   phi,
-            })
-            if len(_state["history"]) > 500:
-                _state["history"] = _state["history"][-500:]
-
-            # ── Почасовая аккумуляция для суточного графика ───────────
-            hour_key = time.strftime("%H")
-            hs = _state["hourly_stats"]
-            if hour_key not in hs:
-                hs[hour_key] = {"cpu_sum": 0, "cpu_max": 0,
-                                "rps_sum": 0, "rps_max": 0,
-                                "cpu_pred_sum": 0, "rps_pred_sum": 0,
-                                "lat_sum": 0, "err_sum": 0, "count": 0}
-            bucket = hs[hour_key]
-            bucket["cpu_sum"] += cpu
-            bucket["cpu_max"] = max(bucket["cpu_max"], cpu)
-            bucket["rps_sum"] += max(rps, 0)
-            bucket["rps_max"] = max(bucket["rps_max"], max(rps, 0))
-            bucket["lat_sum"] += lat
-            bucket["err_sum"] += err
-            # Прогнозные значения (1-step-ahead с прошлой итерации)
-            if prev_cpu_hat is not None:
-                bucket["cpu_pred_sum"] = bucket.get("cpu_pred_sum", 0) + prev_cpu_hat
-            if prev_rps_hat is not None:
-                bucket["rps_pred_sum"] = bucket.get("rps_pred_sum", 0) + prev_rps_hat
-            bucket["count"] += 1
-
-        # Сохраняем 1-step-ahead прогноз для следующей итерации
-        fc = point["forecast"]
-        prev_cpu_hat = fc["cpu_hat"][0] if fc["cpu_hat"] else None
-        prev_rps_hat = fc["rps_hat"][0] if fc["rps_hat"] else None
+        prev_cpu_hat, prev_rps_hat = _apply_sample(
+            cpu, mem, rps, lat, err, phi,
+            r_cur=r_cur, action=action, saturation=(r_cur >= r_max),
+            t_iter=t,
+            prev_cpu_hat=prev_cpu_hat, prev_rps_hat=prev_rps_hat,
+        )
 
         t += 1
-        time.sleep(5)   # Δt = 5 мин в реальности, 5 сек в демо
+        time.sleep(5)
 
 
-# ── Запускаем демо-генератор в фоне ─────────────────────────────────────────
-_demo_thread = threading.Thread(target=_demo_generator, daemon=True)
-_demo_thread.start()
+# ── Выбор и запуск поллера в зависимости от режима ──────────────────────────
+if _mode == "real" and _prometheus_collector is not None:
+    _poller_thread = threading.Thread(
+        target=_real_poller, daemon=True, name="api-real-poller",
+    )
+else:
+    _poller_thread = threading.Thread(
+        target=_demo_generator, daemon=True, name="api-demo-generator",
+    )
+_poller_thread.start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # API ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-@api_app.route("/api/status")
-def api_status():
-    """Текущее состояние системы: метрики, прогноз, число реплик."""
+def _status_snapshot() -> dict:
+    """Формирует снапшот состояния системы — используется и /api/status, и /api/stream."""
     s = get_state()
-    return jsonify({
+    return {
+        "mode": s.get("mode", _mode),
         "metrics": {
             "cpu_t":  s.get("cpu_t", 0),
             "mem_t":  s.get("mem_t", 0),
@@ -390,7 +575,60 @@ def api_status():
         "forecast": s.get("forecast", {"cpu_hat": [], "q_lower": [], "q_upper": []}),
         "iterations": s.get("iterations", 0),
         "timestamp": s.get("timestamp", int(time.time())),
-    })
+    }
+
+
+@api_app.route("/api/status")
+def api_status():
+    """Текущее состояние системы: метрики, прогноз, число реплик. Точечный запрос."""
+    return jsonify(_status_snapshot())
+
+
+@api_app.route("/api/stream")
+def api_stream():
+    """
+    Push-поток обновлений состояния через Server-Sent Events (SSE).
+
+    Клиент (Vue/JS):
+        const es = new EventSource('/api/stream');
+        es.addEventListener('status', (e) => { const d = JSON.parse(e.data); ... });
+
+    Сервер отправляет событие `status` каждый раз, когда счётчик iterations
+    в глобальном состоянии увеличился (т.е. появился новый сэмпл от поллера),
+    а также служебный comment-ping раз в 15 секунд для keep-alive против
+    прокси/балансировщиков.
+    """
+    def gen():
+        last_iterations = -1
+        last_keepalive = time.time()
+        # Сразу шлём текущее состояние, чтобы клиент не ждал следующего тика
+        snap = _status_snapshot()
+        last_iterations = int(snap.get("iterations", 0) or 0)
+        yield f"event: status\ndata: {json.dumps(snap)}\n\n"
+
+        while True:
+            snap = _status_snapshot()
+            it = int(snap.get("iterations", 0) or 0)
+            if it != last_iterations:
+                last_iterations = it
+                yield f"event: status\ndata: {json.dumps(snap)}\n\n"
+                last_keepalive = time.time()
+            elif time.time() - last_keepalive >= 15:
+                # ping-комментарий: браузер его игнорирует, но HTTP-соединение остаётся живым
+                yield ": keep-alive\n\n"
+                last_keepalive = time.time()
+            time.sleep(0.5)
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",   # nginx: не буферизовать SSE
+        "Connection": "keep-alive",
+    }
+    return Response(
+        stream_with_context(gen()),
+        mimetype="text/event-stream",
+        headers=headers,
+    )
 
 
 @api_app.route("/api/history")

@@ -208,24 +208,60 @@ kubectl logs -f deployment/controller
 
 ---
 
-## Шаг 7. Проброс портов
+## Шаг 7. Доступ к сервисам кластера (без port-forward)
 
-Открыть **отдельный терминал**, выполнить и **не закрывать**:
+Сервисы в `k8s/manifests.yaml` теперь объявлены как `NodePort`, а в
+`kind-config.yaml` прописаны `extraPortMappings` — порты контейнера kind
+проброшены на хост. Поэтому **после развёртывания кластера сервисы
+доступны напрямую по localhost, без `kubectl port-forward`**:
 
-```bash
-kubectl port-forward service/webapp 8080:80 &
-kubectl port-forward deployment/webapp 5001:5001 &
-kubectl port-forward service/prometheus 9090:9090 &
-```
+| Сервис | URL с хоста | Назначение |
+|---|---|---|
+| webapp (нагрузка) | http://localhost:8080 | `/compute/*`, `/db/*`, `/memory/*` — цель Locust |
+| webapp-api (SSE/REST) | http://localhost:5001 | REST + push-поток для фронтенда |
+| Prometheus | http://localhost:9090 | UI/query — напрямую в браузере или Grafana |
 
 Проверка:
 ```bash
+# Webapp (нагрузочные маршруты)
 curl http://localhost:8080/health
 # {"status": "ok"}
 
+# API для фронтенда — должен быть в режиме "real"
 curl http://localhost:5001/api/status
-# {"metrics": {...}, "replicas": {...}, "forecast": {...}}
+# {"mode": "real", "metrics": {...}, "replicas": {...}, ...}
+
+# Prometheus UI
+curl http://localhost:9090/-/ready
+# Prometheus is Ready.
 ```
+
+> **Если кластер был создан ДО появления `extraPortMappings`** (в старой
+> версии `kind-config.yaml`), надо его пересоздать:
+> ```bash
+> kind delete cluster --name webapp-cluster
+> kind create cluster --name webapp-cluster --config kind-config.yaml
+> ```
+> Затем заново собрать/загрузить образы и `kubectl apply -f k8s/manifests.yaml`.
+> Старые кластеры без port-mappings работают через `kubectl port-forward`
+> как раньше.
+
+> **Как работает API.** При старте `app/api.py` внутри пода webapp пробует
+> подключиться к Prometheus по адресу `http://prometheus:9090` (in-cluster
+> DNS). Если Prometheus доступен, API включает режим `real`: поллер каждые
+> 5 секунд забирает реальные метрики (CPU, RPS, latency, errors, φ) и
+> читает текущее число реплик из Kubernetes API через ServiceAccount
+> `webapp-sa`. Если Prometheus недоступен (либо API запущен вне кластера
+> без port-forward 9090), API переключается в режим `demo` и генерирует
+> синтетические данные. Текущий режим виден в `/api/status` как поле `mode`.
+
+> **Как фронтенд получает обновления.** Вместо polling'а по таймеру
+> фронтенд подписан на **Server-Sent Events поток `/api/stream`**. Сервер
+> держит HTTP-соединение открытым и отправляет событие `status`
+> каждый раз, когда поллер зафиксирует новый сэмпл (т.е. примерно каждые
+> 5 секунд). Если соединение обрывается, браузер переподключается сам
+> через нативный `EventSource`-retry. Дополнительно сервер шлёт
+> keep-alive пинг раз в 15 секунд, чтобы прокси не закрывали соединение.
 
 ---
 
@@ -253,22 +289,34 @@ npm run dev
 
 ---
 
-## Шаг 9. Запуск без Kubernetes (только демо-режим)
+## Шаг 9. Запуск вне Kubernetes (локальный режим)
 
-Если кластер Kubernetes не нужен — только интерфейс и демо-данные:
+Если нужно быстро поднять только интерфейс — без Docker/kind:
 
 ```bash
-# Терминал 1
+# Терминал 1 — API
 cd project/
 source venv/bin/activate
 python app/api.py
 # Запускается на http://0.0.0.0:5001
 
-# Терминал 2
+# Терминал 2 — фронтенд
 cd project/frontend/
 npm run dev
 # Открыть http://localhost:3000
 ```
+
+**Режимы работы локального API:**
+
+| Условие | Режим | Источник данных |
+|---------|-------|-----------------|
+| Prometheus не запущен | `demo` | Синтетический генератор в `_demo_generator()` |
+| Поднят `kubectl port-forward service/prometheus 9090:9090` | `real` | Реальные метрики из Prometheus + (при наличии kubeconfig) число реплик из K8s |
+| Переменная `DEMO_MODE=1` в окружении | `demo` (принудительно) | Синтетический генератор |
+
+То есть **тот же `python app/api.py`** автоматически подключается к реальному
+Prometheus, если он доступен через port-forward — никаких флагов менять не
+нужно. Режим можно увидеть в `GET /api/status → "mode": "real"|"demo"`.
 
 ---
 

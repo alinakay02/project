@@ -18,17 +18,40 @@
 
 ## 0.1. Схема терминалов
 
-Для полного цикла тестирования нужны **7 терминалов**.
+**С актуальной версией манифестов port-forward больше НЕ нужен** — сервисы
+объявлены как NodePort, а в `kind-config.yaml` проброшены порты хост →
+kind-контейнер → NodePort. Достаточно **4 терминалов**:
 
-| #  | Что работает                  | venv? | Закрывать? |
-|----|-------------------------------|-------|------------|
-| T1 | kubectl, docker, тесты pytest | да    | нет        |
-| T2 | port-forward webapp 8080:80   | нет   | нет        |
-| T3 | port-forward api 5001:5001    | нет   | нет        |
-| T4 | port-forward prometheus 9090  | нет   | нет        |
-| T5 | npm run dev (фронтенд)        | нет   | нет        |
-| T6 | locust master                 | да    | нет        |
-| T7 | locust worker(ы)              | да    | нет        |
+| #  | Что работает                                    | venv? | Закрывать? |
+|----|-------------------------------------------------|-------|------------|
+| T1 | kubectl, docker, тесты pytest                   | да    | нет        |
+| T2 | npm run dev (фронтенд)                          | нет   | нет        |
+| T3 | locust master                                   | да    | нет        |
+| T4 | locust worker(ы)                                | да    | нет        |
+
+Доступ к сервисам кластера после `kubectl apply -f k8s/manifests.yaml`:
+
+| URL с хоста | Что это |
+|---|---|
+| http://localhost:8080 | webapp — нагрузочные маршруты для Locust (`/compute/*`, `/db/*`, `/memory/*`) |
+| http://localhost:5001 | webapp-api — REST/SSE-API для фронтенда |
+| http://localhost:9090 | Prometheus — UI и PromQL |
+
+**Если у тебя СТАРЫЙ кластер** (создан без `extraPortMappings` в
+kind-config.yaml) — либо пересоздай его (см. раздел 1.2), либо используй
+старую схему с port-forward:
+
+```powershell
+# T-pf1: kubectl port-forward service/webapp     8080:80
+# T-pf2: kubectl port-forward service/webapp-api 5001:5001
+# T-pf3: kubectl port-forward service/prometheus 9090:9090
+```
+
+**Про API.** Внутри пода webapp параллельно запускаются `app/main.py`
+(порт 5000 — нагрузочные маршруты) и `app/api.py` (порт 5001 — REST + SSE).
+Сервис `webapp-api` экспонирует только порт 5001. Фронтенд подписан на
+`GET /api/stream` (Server-Sent Events) — получает обновления состояния
+push'ем, без polling'а.
 
 ---
 
@@ -100,15 +123,25 @@ kubectl get pods -w
 
 Жди, пока **все** поды станут `Running` (2-3 минуты). `Ctrl+C` когда готово.
 
-### 1.5. Запустить port-forward (три отдельных терминала)
+### 1.5. Проверить что сервисы доступны напрямую
 
-**T2:** `kubectl port-forward service/webapp 8080:80`
-**T3:** `kubectl port-forward deployment/webapp 5001:5001`
-**T4:** `kubectl port-forward service/prometheus 9090:9090`
+Если кластер создан с актуальным `kind-config.yaml` (с `extraPortMappings`),
+сервисы доступны сразу:
+
+```powershell
+curl http://localhost:8080/health   # webapp: {"status":"ok"}
+curl http://localhost:5001/api/status  # API: "mode":"real"
+curl http://localhost:9090/-/ready   # Prometheus: Prometheus is Ready.
+```
+
+Если кластер создан старой версией kind-config (без port-mappings) — либо
+пересоздай его (`kind delete cluster --name webapp-cluster` + `kind create
+cluster --name webapp-cluster --config kind-config.yaml`), либо подними
+port-forward вручную.
 
 ### 1.6. Запустить фронтенд
 
-**T5:**
+**T2:**
 ```powershell
 cd C:\diplom\project\frontend
 npm run dev
@@ -119,6 +152,36 @@ npm run dev
 - http://localhost:3000 — веб-интерфейс
 - http://localhost:8080/health — `{"status": "ok"}`
 - http://localhost:9090 — Prometheus UI
+- http://localhost:5001/api/status — JSON с полем `"mode": "real"`
+- http://localhost:5001/api/stream — SSE-поток. В браузере DevTools →
+  Network → фильтр «eventsource» должна висеть подписка с событиями `status`.
+
+### 1.8. Если API в режиме demo, а должен быть real
+
+Возможные причины:
+- **Под webapp не перезапущен после правок манифеста** — выполни
+  `kubectl rollout restart deployment/webapp` и подожди `Running`.
+- **Не пересобран Docker-образ** после правок `app/api.py` — выполни
+  `docker build -f Dockerfile.webapp -t webapp:latest . && kind load docker-image webapp:latest --name webapp-cluster && kubectl rollout restart deployment/webapp`.
+- **Под не имеет RBAC-прав на чтение Deployment** — проверь что в
+  манифесте есть `ServiceAccount webapp-sa` + `ClusterRole webapp-role` +
+  `ClusterRoleBinding webapp-rolebinding` и что Deployment использует
+  `serviceAccountName: webapp-sa`. Посмотреть: `kubectl logs deployment/webapp -c webapp | grep -i 'mode\|prometheus\|kubernetes'`.
+
+### 1.9. Проверка push-обновлений фронтенда (SSE)
+
+Открой http://localhost:3000, открой DevTools (F12) → Network → вкладка
+«EventSource» или фильтр `stream`. Должна висеть одна подписка
+`/api/stream` в состоянии pending (это нормально для SSE — соединение
+долгоживущее). При каждом новом сэмпле от поллера в ней появляется
+строка `event: status\ndata: {...}`. На фронтенде значения обновляются
+без перезагрузки страницы и без периодических GET-запросов на
+`/api/status`.
+
+Если в Network вкладке вместо одной SSE-подписки видно множество
+повторяющихся `GET /api/status` каждые 5 секунд — значит фронтенд не
+подхватил изменение. Переподключись к dev-серверу или очисти кэш
+браузера (Ctrl+Shift+R).
 
 ---
 
