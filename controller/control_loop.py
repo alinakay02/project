@@ -103,6 +103,23 @@ class ControlLoop:
             deployment_name=k8s_cfg["deployment_name"],
         )
 
+        # Sync _r_cur with the actual cluster state — иначе контроллер
+        # стартует с r_min=2, а в манифесте deployment'а уже стоит
+        # replicas=4, и первое решение "не нужно масштабировать" принимается
+        # на основе неверного значения.
+        if k8s_client is not None and self.decision_module._k8s is not None:
+            try:
+                from kubernetes import client as kc
+                scale = kc.AppsV1Api().read_namespaced_deployment_scale(
+                    name=k8s_cfg["deployment_name"],
+                    namespace=k8s_cfg["namespace"],
+                )
+                cur = int(scale.spec.replicas)
+                self.decision_module._r_cur = cur
+                logger.info(f"Synced _r_cur with cluster: {cur} replicas")
+            except Exception as e:
+                logger.warning(f"Could not sync replicas with cluster: {e}")
+
         # ── Сборщик метрик ────────────────────────────────────────────────
         self.collector = PrometheusCollector(
             prometheus_url=prom_cfg["url"],
@@ -250,7 +267,12 @@ class ControlLoop:
         r_new = math.ceil(r_cur * cpu_t / self.decision_module.cpu_target)
         r_new = max(self.decision_module.r_min,
                     min(self.decision_module.r_max, r_new))
-        self.decision_module._r_cur = r_new
+        if r_new != self.decision_module._r_cur:
+            old = self.decision_module._r_cur
+            self.decision_module._r_cur = r_new
+            if self.decision_module._k8s is not None:
+                self.decision_module._apply_k8s(r_new)
+            logger.info(f"Reactive HPA: {old} -> {r_new} (cpu_t={cpu_t:.2f})")
         return DecisionResult(
             r_req=r_new, r_bounded=r_new, r_fin=r_new,
             action="hpa_reactive", delta_t=0.0,

@@ -12,8 +12,9 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
 COPY config.yaml .
 COPY predictor/ ./predictor/
 COPY controller/ ./controller/
+COPY data/alibaba_cluster_trace_2018.csv ./data/
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "-c", "from controller.control_loop import ControlLoop; ControlLoop().run()"]
+CMD ["python", "-m", "controller.bootstrap"]
