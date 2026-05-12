@@ -8,13 +8,11 @@ Alibaba выбран потому, что его утилизация CPU нах
 CPU слишком низкая (0.15-0.25), из-за чего r_req всегда ограничивается
 r_min=2 и решения о масштабировании не принимаются.
 
-ВАЖНО: прогноз forecaster'а q_upper выдаётся в долях [0,1]. Формула
-decision module r_req = ceil(q_upper / cpu_target) рассчитана на q_upper
-как «предсказанную нагрузку в единицах реплик» (т.е. уже умноженную
-на текущее число реплик). В симуляции ниже мы явно масштабируем прогноз:
-  load_in_replicas = q_upper * r_cur
-и подаём это в decision.step(). Так правильно учитывается, что чем
-больше текущих реплик — тем больше суммарная ёмкость.
+ВАЖНО: прогноз forecaster'а q_upper выдаётся в долях [0,1] — это
+средняя утилизация по подам. Формула decision module
+r_req = ceil(r_cur · q_upper / cpu_target) сама учитывает текущее число
+реплик (см. controller/decision.py), поэтому в симуляции прогноз
+передаётся в decision.step() как есть, без предварительного масштабирования.
 
 Пять конфигураций:
   1. Полный метод                — HybridForecaster + стандартный DecisionModule
@@ -101,7 +99,7 @@ class FixedDeltaDecisionModule(ResourceDecisionModule):
 
     def step(self, q_upper, q_lower):
         import math
-        r_req = math.ceil(q_upper / self.cpu_target)
+        r_req = math.ceil(self._r_cur * q_upper / self.cpu_target)
         r_req = max(r_req, self.r_min)
         saturation = False
         r_bounded = min(r_req, self.r_max)
@@ -141,11 +139,10 @@ def _simulate_control_loop(forecaster, decision_module, cpu_train, cpu_test,
     """
     Симулирует цикл управления на тестовой выборке.
 
-    Прогноз forecaster'а даётся в долях cpu∈[0,1]. Для decision module
-    прогноз масштабируется на текущее число реплик:
-      load_in_replicas = q_upper * r_cur
-    т.к. формула r_req = ceil(q_upper_scaled / cpu_target) рассчитывает
-    требуемое число реплик исходя из «предсказанной суммарной нагрузки».
+    Прогноз forecaster'а даётся в долях cpu∈[0,1] — это средняя
+    утилизация по подам. decision_module.step() сам умножит q_upper на
+    текущее число реплик (формула 3.7: r_req = ceil(r_cur · q_upper / cpu_target)),
+    поэтому здесь q_upper передаётся как есть.
 
     Возвращает:
       y_true, y_pred, r_history
@@ -180,12 +177,9 @@ def _simulate_control_loop(forecaster, decision_module, cpu_train, cpu_test,
             q_up_raw = float(hi[0])
             q_lo_raw = float(lo[0])
 
-        # Масштабирование на текущее число реплик
-        r_cur = decision_module.current_replicas
-        q_up_scaled = q_up_raw * r_cur
-        q_lo_scaled = q_lo_raw * r_cur
-
-        res = decision_module.step(q_up_scaled, q_lo_scaled)
+        # decision_module.step сам учитывает r_cur через формулу
+        # r_req = ceil(r_cur · q_upper / cpu_target)
+        res = decision_module.step(q_up_raw, q_lo_raw)
         # r_fin распространяется на h шагов (до следующего вызова step)
         for _ in range(min(h, len(cpu_test) - i)):
             r_history.append(res.r_fin)

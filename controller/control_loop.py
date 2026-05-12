@@ -26,6 +26,52 @@ from controller.prometheus_collector import PrometheusCollector
 
 logger = logging.getLogger(__name__)
 
+# ── Prometheus-метрики прогнозов и решений ─────────────────────────────────
+# Публикуются на /metrics (HTTP server поднимается в bootstrap.py), Prometheus
+# скрейпит их раз в 5 секунд. Тем самым прогнозы за прошедшее время сохраняются
+# в TSDB и доступны для отображения на графиках истории.
+from prometheus_client import Gauge
+
+FORECAST_CPU = Gauge(
+    "controller_forecast_cpu",
+    "Прогноз медианы утилизации CPU (доля от лимита) на k шагов вперёд",
+    ["horizon"],
+)
+FORECAST_CPU_LOWER = Gauge(
+    "controller_forecast_cpu_lower",
+    "Нижний квантиль ε/2 прогноза CPU",
+    ["horizon"],
+)
+FORECAST_CPU_UPPER = Gauge(
+    "controller_forecast_cpu_upper",
+    "Верхний квантиль 1-ε/2 прогноза CPU (используется для масштабирования)",
+    ["horizon"],
+)
+DECISION_R_REQ = Gauge(
+    "controller_decision_r_req",
+    "Требуемое число реплик по формуле 3.7 (до применения r_max)",
+)
+DECISION_R_FIN = Gauge(
+    "controller_decision_r_fin",
+    "Итоговое решение о числе реплик (формула 3.18, после гистерезиса)",
+)
+DECISION_DELTA_T = Gauge(
+    "controller_decision_delta_t",
+    "Адаптивный порог гистерезиса δ_t (формула 3.17)",
+)
+DECISION_SATURATION = Gauge(
+    "controller_decision_saturation",
+    "1 если r_req превышает r_max (RESOURCE_SATURATION), иначе 0",
+)
+DECISION_CONFIRM_COUNTER = Gauge(
+    "controller_decision_confirm_counter",
+    "Счётчик подтверждения масштабирования вниз (растёт до tau шагов)",
+)
+DECISION_ITERATION = Gauge(
+    "controller_iteration",
+    "Текущая итерация управляющего цикла",
+)
+
 
 class ControlLoop:
     """
@@ -200,6 +246,13 @@ class ControlLoop:
                 cpu_hat, q_lower, q_upper = self.forecaster.predict(
                     cpu_arr, ts_arr, phi_arr.T if phi_arr.ndim == 2 else phi_arr
                 )
+                # Публикуем прогнозы по всем горизонтам в Prometheus
+                for k in range(len(cpu_hat)):
+                    h_label = str(k + 1)
+                    FORECAST_CPU.labels(horizon=h_label).set(float(cpu_hat[k]))
+                    FORECAST_CPU_LOWER.labels(horizon=h_label).set(float(q_lower[k]))
+                    FORECAST_CPU_UPPER.labels(horizon=h_label).set(float(q_upper[k]))
+
                 # Используем h=1 (первый шаг) для текущего управляющего воздействия
                 result = self.decision_module.step(
                     q_upper=float(q_upper[0]),
@@ -227,7 +280,16 @@ class ControlLoop:
             self._retrain()
             self._is_initial_training_done = True
 
-        # ── 4. Логирование ────────────────────────────────────────────────
+        # ── 4. Публикация решения в Prometheus ────────────────────────────
+        DECISION_ITERATION.set(float(self.iteration))
+        if result is not None:
+            DECISION_R_REQ.set(float(result.r_req))
+            DECISION_R_FIN.set(float(result.r_fin))
+            DECISION_DELTA_T.set(float(result.delta_t))
+            DECISION_SATURATION.set(1.0 if result.saturation else 0.0)
+            DECISION_CONFIRM_COUNTER.set(float(result.confirm_counter))
+
+        # ── 5. Логирование ────────────────────────────────────────────────
         record = {
             "iteration": self.iteration,
             "timestamp": now_ts,

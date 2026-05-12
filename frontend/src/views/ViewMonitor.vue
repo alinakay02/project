@@ -482,8 +482,12 @@ async function fetchConfig() {
 }
 async function pollSlow() {
   try {
+    // range=60m + step=60s даёт 60 точек за час — соответствует UI-кнопке «60 мин».
+    // step выбран кратным cadence публикации прогноза контроллером (5 мин),
+    // поэтому на графике прогноз отображается ступенчатой оранжевой линией
+    // с переходами каждые 5 точек = 5 минут.
     const [h, l] = await Promise.all([
-      axios.get('/api/history?n=80'),
+      axios.get('/api/history?range=60m&step=60'),
       axios.get('/api/load'),
     ])
     history.value = h.data.history || []

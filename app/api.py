@@ -35,6 +35,7 @@ import math
 import json
 import logging
 import os
+import re
 import numpy as np
 import yaml
 from scipy.stats import linregress
@@ -197,6 +198,72 @@ def _probe_prometheus(url: str, timeout: float = 3.0) -> bool:
     except Exception as e:
         logger.info("Prometheus probe failed: %s (url=%s)", e, url)
         return False
+
+
+def _prometheus_range_query(query, start_ts, end_ts, step_sec=15):
+    """
+    Выполняет PromQL query_range и возвращает [(timestamp, value), ...].
+
+    Используется для построения истории за произвольный период напрямую из
+    Prometheus — это надёжный источник, переживающий рестарты Flask и
+    одинаковый для всех реплик webapp.
+
+    Аргументы:
+      query     : PromQL-запрос (агрегированный, чтобы вернулась одна серия)
+      start_ts  : UNIX timestamp начала окна
+      end_ts    : UNIX timestamp конца окна
+      step_sec  : шаг между точками в секундах
+
+    Возвращает пустой список при любых ошибках.
+    """
+    if _prometheus_collector is None:
+        return []
+    try:
+        import requests
+        url = f"{_PROMETHEUS_URL.rstrip('/')}/api/v1/query_range"
+        r = requests.get(
+            url,
+            params={
+                "query": query,
+                "start": start_ts,
+                "end":   end_ts,
+                "step":  step_sec,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        results = r.json().get("data", {}).get("result", [])
+        if not results:
+            return []
+        # Агрегированный запрос возвращает одну серию; берём её values
+        values = results[0].get("values", [])
+        out = []
+        for ts, v in values:
+            if v in ("NaN", None):
+                continue
+            try:
+                val = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(val):
+                continue
+            out.append((float(ts), val))
+        return out
+    except Exception as e:
+        logger.warning("Prometheus range query failed: %s | query=%s", e, query[:80])
+        return []
+
+
+def _parse_range(range_str, default_seconds):
+    """Парсит строку вроде '60m', '6h', '24h', '7d' → секунды. Fallback при ошибке."""
+    if not range_str:
+        return default_seconds
+    m = re.match(r"^(\d+)([smhd])$", range_str.strip().lower())
+    if not m:
+        return default_seconds
+    num = int(m.group(1))
+    unit = m.group(2)
+    return num * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
 def _build_k8s_apps_client():
@@ -633,46 +700,215 @@ def api_stream():
 
 @api_app.route("/api/history")
 def api_history():
-    """История метрик за последние N точек."""
-    n = int(request.args.get("n", 100))
-    with _state_lock:
-        hist = _state["history"][-n:]
-    return jsonify({"history": hist, "count": len(hist)})
+    """
+    История метрик за заданный период.
+
+    Источники:
+      • real-режим — Prometheus query_range (постоянный, общий для всех реплик).
+      • demo / Prometheus недоступен — in-memory _state["history"] (поллер).
+
+    Параметры query string:
+      n     — число точек (default: 80). При отсутствии range используется как
+              ориентир: окно = n × step.
+      range — окно времени: "60m", "6h", "24h", "7d". Имеет приоритет над n.
+      step  — шаг в секундах (default: 15).
+
+    Поля cpu_pred / rps_pred остаются null при источнике prometheus, т.к.
+    исторические предсказания модели не сохраняются в TSDB.
+    """
+    n = int(request.args.get("n", 80))
+    step = max(1, int(request.args.get("step", 15)))
+    range_str = request.args.get("range", "")
+
+    # ── Fallback на in-memory: demo-режим или Prometheus недоступен ──────
+    if _mode != "real" or _prometheus_collector is None:
+        with _state_lock:
+            hist = _state["history"][-n:]
+        return jsonify({"history": hist, "count": len(hist), "source": "memory"})
+
+    # ── Real-режим: Prometheus query_range ────────────────────────────────
+    end_ts = int(time.time())
+    window_sec = _parse_range(range_str, n * step)
+    start_ts = end_ts - window_sec
+
+    cpu_series = _prometheus_range_query(_PROMQL_QUERIES.get("cpu", ""), start_ts, end_ts, step)
+    mem_series = _prometheus_range_query(_PROMQL_QUERIES.get("mem", ""), start_ts, end_ts, step)
+    rps_series = _prometheus_range_query(_PROMQL_QUERIES.get("rps", ""), start_ts, end_ts, step)
+    lat_series = _prometheus_range_query(_PROMQL_QUERIES.get("lat_p95", ""), start_ts, end_ts, step)
+    err_series = _prometheus_range_query(_PROMQL_QUERIES.get("err_rate", ""), start_ts, end_ts, step)
+    rep_query = (
+        f'kube_deployment_spec_replicas{{namespace="{_K8S_NAMESPACE}",'
+        f'deployment="{_K8S_DEPLOYMENT}"}}'
+    )
+    rep_series = _prometheus_range_query(rep_query, start_ts, end_ts, step)
+
+    # Прогнозы CPU из метрик контроллера (controller_forecast_*).
+    # Агрегируем через max() для устойчивости к перезапускам controller pod'а:
+    # при rolling update в TSDB появляются несколько временных серий с разными
+    # лейблами pod/instance — каждая со своим набором timestamps. avg/max/min
+    # сольёт их в одну серию, чтобы _prometheus_range_query видел все точки.
+    # max используется потому что в один момент времени активен ровно один
+    # под controller (replicas=1).
+    cpu_pred_series = _prometheus_range_query(
+        'max(controller_forecast_cpu{horizon="1"})', start_ts, end_ts, step,
+    )
+    cpu_pred_lower = _prometheus_range_query(
+        'max(controller_forecast_cpu_lower{horizon="1"})', start_ts, end_ts, step,
+    )
+    cpu_pred_upper = _prometheus_range_query(
+        'max(controller_forecast_cpu_upper{horizon="1"})', start_ts, end_ts, step,
+    )
+
+    by_ts = {}
+    for ts, v in cpu_series:      by_ts.setdefault(int(ts), {})["cpu"]      = round(v, 4)
+    for ts, v in mem_series:      by_ts.setdefault(int(ts), {})["mem"]      = round(v, 4)
+    for ts, v in rps_series:      by_ts.setdefault(int(ts), {})["rps"]      = round(v, 1)
+    for ts, v in lat_series:      by_ts.setdefault(int(ts), {})["lat"]      = round(v, 1)
+    for ts, v in err_series:      by_ts.setdefault(int(ts), {})["err"]      = round(v, 5)
+    for ts, v in rep_series:      by_ts.setdefault(int(ts), {})["r_cur"]    = int(v)
+    for ts, v in cpu_pred_series: by_ts.setdefault(int(ts), {})["cpu_pred"] = round(v, 4)
+    for ts, v in cpu_pred_lower:  by_ts.setdefault(int(ts), {})["cpu_lo"]   = round(v, 4)
+    for ts, v in cpu_pred_upper:  by_ts.setdefault(int(ts), {})["cpu_hi"]   = round(v, 4)
+
+    history = []
+    last_r = _runtime_config.get("r_min", 2)
+    for ts in sorted(by_ts.keys()):
+        row = by_ts[ts]
+        if "r_cur" in row:
+            last_r = row["r_cur"]
+        history.append({
+            "ts":       ts,
+            "cpu":      row.get("cpu", 0.0),
+            "cpu_pred": row.get("cpu_pred"),    # из controller_forecast_cpu
+            "cpu_lo":   row.get("cpu_lo"),      # нижний квантиль прогноза
+            "cpu_hi":   row.get("cpu_hi"),      # верхний квантиль прогноза
+            "mem":      row.get("mem", 0.0),
+            "rps":      row.get("rps", 0.0),
+            "rps_pred": None,                   # RPS-прогноз пока не публикуется
+            "lat":      row.get("lat", 0.0),
+            "err":      row.get("err", 0.0),
+            "r_cur":    last_r,
+            "phi":      [0.333, 0.333, 0.334],
+        })
+
+    # Возвращаем не больше n при заданном n без range (для backward compat).
+    if not range_str and len(history) > n:
+        history = history[-n:]
+
+    return jsonify({"history": history, "count": len(history), "source": "prometheus"})
 
 
 @api_app.route("/api/history/daily")
 def api_history_daily():
-    """Почасовая статистика за последние 24 часа."""
-    with _state_lock:
-        hs = dict(_state["hourly_stats"])
+    """
+    Почасовая статистика за последние 24 часа.
 
-    # Формируем 24 слота (00..23), заполняем имеющимися данными
+    Источник:
+      • real-режим — Prometheus query_range за 24ч с шагом 1 мин, агрегация
+        в Python по локальному часу суток.
+      • demo / Prometheus недоступен — in-memory _state["hourly_stats"].
+
+    cpu_pred_avg / rps_pred_avg всегда null в режиме prometheus.
+    """
+    # ── Fallback на in-memory ────────────────────────────────────────────
+    if _mode != "real" or _prometheus_collector is None:
+        with _state_lock:
+            hs = dict(_state["hourly_stats"])
+        result = []
+        for h_int in range(24):
+            key = f"{h_int:02d}"
+            label = f"{key}:00"
+            if key in hs:
+                s = hs[key]
+                c = s["count"] or 1
+                result.append({
+                    "hour": label,
+                    "cpu_avg": round(s["cpu_sum"] / c, 4),
+                    "cpu_max": round(s["cpu_max"], 4),
+                    "cpu_pred_avg": round(s.get("cpu_pred_sum", 0) / c, 4),
+                    "rps_avg": round(s["rps_sum"] / c, 1),
+                    "rps_max": round(s["rps_max"], 1),
+                    "rps_pred_avg": round(s.get("rps_pred_sum", 0) / c, 1),
+                    "lat_avg": round(s["lat_sum"] / c, 1),
+                    "count": s["count"],
+                })
+            else:
+                result.append({
+                    "hour": label,
+                    "cpu_avg": None, "cpu_max": None, "cpu_pred_avg": None,
+                    "rps_avg": None, "rps_max": None, "rps_pred_avg": None,
+                    "lat_avg": None, "count": 0,
+                })
+        return jsonify({"hourly": result, "source": "memory"})
+
+    # ── Real-режим: Prometheus query_range за 24 часа ────────────────────
+    end_ts = int(time.time())
+    start_ts = end_ts - 24 * 3600
+    step = 60  # 1 минута — достаточно для агрегирования по часам
+
+    cpu_series      = _prometheus_range_query(_PROMQL_QUERIES.get("cpu", ""), start_ts, end_ts, step)
+    rps_series      = _prometheus_range_query(_PROMQL_QUERIES.get("rps", ""), start_ts, end_ts, step)
+    lat_series      = _prometheus_range_query(_PROMQL_QUERIES.get("lat_p95", ""), start_ts, end_ts, step)
+    cpu_pred_series = _prometheus_range_query(
+        'max(controller_forecast_cpu{horizon="1"})', start_ts, end_ts, step,
+    )
+
+    # Бакеты "00".."23" — час локального времени
+    hourly = {f"{h:02d}": {
+        "cpu_sum": 0.0, "cpu_max": 0.0,
+        "rps_sum": 0.0, "rps_max": 0.0,
+        "lat_sum": 0.0,
+        "cpu_pred_sum": 0.0, "cpu_pred_count": 0,
+        "count":   0,
+    } for h in range(24)}
+
+    for ts, v in cpu_series:
+        h = time.strftime("%H", time.localtime(ts))
+        b = hourly[h]
+        b["cpu_sum"] += v
+        b["cpu_max"] = max(b["cpu_max"], v)
+        b["count"]  += 1
+    for ts, v in rps_series:
+        h = time.strftime("%H", time.localtime(ts))
+        b = hourly[h]
+        b["rps_sum"] += v
+        b["rps_max"] = max(b["rps_max"], v)
+    for ts, v in lat_series:
+        h = time.strftime("%H", time.localtime(ts))
+        b = hourly[h]
+        b["lat_sum"] += v
+    for ts, v in cpu_pred_series:
+        h = time.strftime("%H", time.localtime(ts))
+        b = hourly[h]
+        b["cpu_pred_sum"]   += v
+        b["cpu_pred_count"] += 1
+
     result = []
     for h_int in range(24):
         key = f"{h_int:02d}"
-        label = f"{key}:00"
-        if key in hs:
-            s = hs[key]
-            c = s["count"] or 1
+        b = hourly[key]
+        if b["count"] > 0:
+            c = b["count"]
+            pc = b["cpu_pred_count"]
             result.append({
-                "hour": label,
-                "cpu_avg": round(s["cpu_sum"] / c, 4),
-                "cpu_max": round(s["cpu_max"], 4),
-                "cpu_pred_avg": round(s.get("cpu_pred_sum", 0) / c, 4),
-                "rps_avg": round(s["rps_sum"] / c, 1),
-                "rps_max": round(s["rps_max"], 1),
-                "rps_pred_avg": round(s.get("rps_pred_sum", 0) / c, 1),
-                "lat_avg": round(s["lat_sum"] / c, 1),
-                "count": s["count"],
+                "hour":         f"{key}:00",
+                "cpu_avg":      round(b["cpu_sum"] / c, 4),
+                "cpu_max":      round(b["cpu_max"], 4),
+                "cpu_pred_avg": round(b["cpu_pred_sum"] / pc, 4) if pc > 0 else None,
+                "rps_avg":      round(b["rps_sum"] / c, 1),
+                "rps_max":      round(b["rps_max"], 1),
+                "rps_pred_avg": None,
+                "lat_avg":      round(b["lat_sum"] / c, 1),
+                "count":        c,
             })
         else:
             result.append({
-                "hour": label,
-                "cpu_avg": None, "cpu_max": None, "cpu_pred_avg": None,
-                "rps_avg": None, "rps_max": None, "rps_pred_avg": None,
-                "lat_avg": None, "count": 0,
+                "hour":         f"{key}:00",
+                "cpu_avg":      None, "cpu_max":      None, "cpu_pred_avg": None,
+                "rps_avg":      None, "rps_max":      None, "rps_pred_avg": None,
+                "lat_avg":      None, "count":        0,
             })
-    return jsonify({"hourly": result})
+    return jsonify({"hourly": result, "source": "prometheus"})
 
 
 @api_app.route("/api/load", methods=["GET"])

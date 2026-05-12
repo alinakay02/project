@@ -29,8 +29,10 @@ rules:
     resources: ["deployments", "deployments/scale"]
     verbs: ["get", "list", "patch", "update"]
   - apiGroups: [""]
-    resources: ["pods", "pods/metrics"]
+    resources: ["pods", "pods/metrics", "nodes", "nodes/proxy", "nodes/metrics", "services", "endpoints"]
     verbs: ["get", "list"]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -166,7 +168,7 @@ metadata:
   name: webapp
   namespace: default
 spec:
-  replicas: 4          # r_min = 2
+  replicas: 2          # r_min = 2
   selector:
     matchLabels:
       app: webapp
@@ -199,14 +201,17 @@ spec:
               path: /ready
               port: 5000
             initialDelaySeconds: 15
-            periodSeconds: 5
-            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /health
               port: 5000
             initialDelaySeconds: 30
-            periodSeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
           env:
             - name: PYTHONPATH
               value: "/app"
@@ -271,12 +276,19 @@ spec:
     metadata:
       labels:
         app: controller
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
     spec:
       serviceAccountName: controller-sa
       containers:
         - name: controller
           image: controller:latest
           imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000   # prometheus_client HTTP server
+              name: metrics
           resources:
             requests:
               cpu: "200m"
@@ -323,7 +335,7 @@ data:
       lr: 0.001
       lr_decay: 0.99
       grad_clip: 1.0
-      max_epochs: 100
+      max_epochs: 40
       patience: 10
       batch_size: 32
       retrain_every: 60
@@ -392,6 +404,7 @@ data:
       scrape_interval: 5s
     scrape_configs:
       - job_name: 'webapp'
+        scrape_timeout: 4s
         kubernetes_sd_configs:
           - role: pod
             namespaces:
@@ -400,6 +413,9 @@ data:
           - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
             action: keep
             regex: "true"
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: "webapp"
           - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
             target_label: __metrics_path__
           - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
@@ -407,14 +423,53 @@ data:
             regex: ([^:]+)(?::\d+)?;(\d+)
             replacement: $1:$2
             target_label: __address__
-      - job_name: 'cadvisor'
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      - job_name: 'controller'
         kubernetes_sd_configs:
-          - role: node
-        metrics_path: /metrics/cadvisor
+          - role: pod
+            namespaces:
+              names: ['default']
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: "controller"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            target_label: __metrics_path__
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      - job_name: 'cadvisor'
         scheme: https
         tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
           insecure_skip_verify: true
         bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+      - job_name: 'kube-state-metrics'
+        static_configs:
+          - targets: ['kube-state-metrics.kube-system.svc:8080']
 
 ---
 # Prometheus — Deployment

@@ -64,6 +64,18 @@ def load_alibaba(path: str, n_points: int) -> dict:
 
 
 def main() -> None:
+    # Поднимаем HTTP-сервер prometheus_client на 8000/metrics —
+    # Prometheus скрейпит его через kubernetes_sd_configs (см. manifests.yaml).
+    # Метрики controller_forecast_* и controller_decision_* определены в
+    # control_loop.py и автоматически регистрируются в default-реестре.
+    try:
+        from prometheus_client import start_http_server
+        metrics_port = int(os.environ.get("PROMETHEUS_METRICS_PORT", "8000"))
+        start_http_server(metrics_port)
+        logger.info(f"Prometheus metrics server listening on :{metrics_port}/metrics")
+    except Exception as e:
+        logger.warning(f"Failed to start Prometheus metrics server: {e}")
+
     dataset_path = os.environ.get("ALIBABA_DATASET", DEFAULT_DATASET)
     if not os.path.exists(dataset_path):
         logger.error(

@@ -109,7 +109,11 @@ class ResourceDecisionModule:
           DecisionResult с итоговым r_fin и описанием действия.
         """
         # ── Шаг 1: r_req (формула 3.7) ────────────────────────────────────
-        r_req = math.ceil(q_upper / self.cpu_target)
+        # q_upper — средняя утилизация по подам (доля от лимита одного пода).
+        # Чтобы при изменении нагрузки удерживать среднюю утилизацию на cpu_target,
+        # из условия r_cur · q_upper = r_req · cpu_target получаем:
+        #   r_req = ceil(r_cur · q_upper / cpu_target).
+        r_req = math.ceil(self._r_cur * q_upper / self.cpu_target)
         r_req = max(r_req, self.r_min)
 
         # ── Шаг 2: Проверка ограничений инфраструктуры ────────────────────
