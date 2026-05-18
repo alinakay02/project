@@ -1,12 +1,12 @@
 """
-app/main.py — Монолитное веб-приложение (глава 4, параграф 4.1)
+app/main.py — Монолитное веб-приложение.
 
 Девять маршрутов трёх функциональных классов:
   Класс 1 (compute): /compute/light, /compute/medium, /compute/heavy
   Класс 2 (db):      /db/read, /db/write, /db/aggregate
   Класс 3 (memory):  /memory/alloc, /memory/process, /memory/gc
 
-Метка class_id в счётчике Prometheus обеспечивает формирование φ_t (форм. 3.2).
+Метка class_id в счётчике Prometheus обеспечивает формирование вектора φ_t.
 """
 
 import gc
@@ -37,7 +37,7 @@ MAX_OVERFLOW = CFG["webapp"]["sqlalchemy_max_overflow"]
 app = Flask(__name__)
 metrics = PrometheusMetrics(app)
 
-# Счётчик с меткой class_id для формирования вектора φ_t (формула 3.2)
+# Счётчик с меткой class_id для формирования вектора φ_t
 request_counter = Counter(
     "http_requests_total",
     "Total HTTP requests by class",

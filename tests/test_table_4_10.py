@@ -1,5 +1,5 @@
 """
-tests/test_table_4_10.py — Таблица 4.10: Анализ вклада компонентов метода
+tests/test_table_4_10.py — Анализ вклада компонентов метода
 на наборе Alibaba Cluster Trace 2018 при горизонте h = 3.
 
 Alibaba выбран потому, что его утилизация CPU находится в рабочем
@@ -11,7 +11,7 @@ r_min=2 и решения о масштабировании не принима�
 ВАЖНО: прогноз forecaster'а q_upper выдаётся в долях [0,1] — это
 средняя утилизация по подам. Формула decision module
 r_req = ceil(r_cur · q_upper / cpu_target) сама учитывает текущее число
-реплик (см. controller/decision.py), поэтому в симуляции прогноз
+реплик, поэтому в симуляции прогноз
 передаётся в decision.step() как есть, без предварительного масштабирования.
 
 Пять конфигураций:
@@ -141,7 +141,7 @@ def _simulate_control_loop(forecaster, decision_module, cpu_train, cpu_test,
 
     Прогноз forecaster'а даётся в долях cpu∈[0,1] — это средняя
     утилизация по подам. decision_module.step() сам умножит q_upper на
-    текущее число реплик (формула 3.7: r_req = ceil(r_cur · q_upper / cpu_target)),
+    текущее число реплик (r_req = ceil(r_cur · q_upper / cpu_target)),
     поэтому здесь q_upper передаётся как есть.
 
     Возвращает:
@@ -254,7 +254,7 @@ CONFIGS = [
 
 
 class TestTable410:
-    """Таблица 4.10: абляция на Alibaba."""
+    """Абляция на Alibaba."""
 
     def test_ablation(self):
         cpu, ts, phi = load_alibaba_trace()

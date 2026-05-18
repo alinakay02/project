@@ -65,7 +65,7 @@ def load_alibaba(path: str, n_points: int) -> dict:
 
 def main() -> None:
     # Поднимаем HTTP-сервер prometheus_client на 8000/metrics —
-    # Prometheus скрейпит его через kubernetes_sd_configs (см. manifests.yaml).
+    # Prometheus скрейпит его через kubernetes_sd_configs.
     # Метрики controller_forecast_* и controller_decision_* определены в
     # control_loop.py и автоматически регистрируются в default-реестре.
     try:

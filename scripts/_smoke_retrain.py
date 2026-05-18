@@ -44,7 +44,7 @@ def main():
     n = len(cpu)
     # initial fit на первых 22 сутках (6336 точек)
     initial_end = 22 * POINTS_PER_DAY
-    # Тестовый сегмент сутки 3-4 (после initial fit): seg2 в table 4.8
+    # Тестовый сегмент сутки 3-4 (после initial fit)
     seg_start = initial_end + SEG_SIZE   # сутки 3-4 = позиции [6912, 7488)
     seg_end = seg_start + SEG_SIZE
 

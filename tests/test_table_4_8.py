@@ -1,5 +1,5 @@
 """
-tests/test_table_4_8.py — Таблица 4.8: Влияние дообучения на точность
+tests/test_table_4_8.py — Влияние дообучения на точность
 прогноза во времени на наборе Azure VM Trace 2019 (30 суток).
 
 Сравнивает две конфигурации:
@@ -157,7 +157,7 @@ def _run_one_config(with_retrain: bool, seed: int, cpu, ts, phi):
 
 
 class TestTable48:
-    """Таблица 4.8: дообучение vs без дообучения (Azure, 8 суток теста)."""
+    """Дообучение vs без дообучения (Azure, 8 суток теста)."""
 
     def test_retrain_effect(self):
         cpu, ts, phi = load_azure_trace()

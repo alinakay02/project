@@ -1,11 +1,11 @@
 """
-controller/decision.py — Модуль принятия решений об управлении ресурсами (параграф 3.2.3)
+controller/decision.py — Модуль принятия решений об управлении ресурсами.
 
 Реализует:
-  - Вычисление r_req по формуле (3.7)
-  - Проверку ограничений инфраструктуры (формула 3.6, условие 3.3)
-  - Механизм гистерезиса с адаптивным порогом δ_t (формулы 3.16, 3.17)
-  - Итоговое воздействие r_fin (формула 3.18)
+  - Вычисление требуемого числа реплик r_req
+  - Проверку ограничений инфраструктуры (кластер + СУБД)
+  - Механизм гистерезиса с адаптивным порогом δ_t
+  - Итоговое воздействие r_fin
   - PATCH-запрос к Kubernetes API
 """
 
@@ -21,13 +21,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DecisionResult:
     """Результат одного шага принятия решений."""
-    r_req: int              # требуемое число реплик по формуле (3.7)
-    r_bounded: int          # после применения ограничений r_max
-    r_fin: int              # итоговое воздействие (формула 3.18)
-    action: str             # "scale_up" | "scale_down" | "no_change" | "saturated"
-    delta_t: float          # адаптивный порог δ_t (формула 3.17)
-    saturation: bool        # True если r_req > r_max (RESOURCE_SATURATION)
-    confirm_counter: int    # текущий счётчик подтверждения масштабирования вниз
+    r_req: int
+    r_bounded: int
+    r_fin: int
+    action: str
+    delta_t: float
+    saturation: bool
+    confirm_counter: int
     timestamp: str = field(default_factory=lambda: datetime.datetime.utcnow().isoformat())
 
 
@@ -71,7 +71,7 @@ class ResourceDecisionModule:
         self.deployment_name = deployment_name
         self._k8s = kubernetes_client
 
-        # Ограничение СУБД (формула 3.3): r_max_db = ⌊(max_conn - conn_reserve) / pool_size⌋
+        # Ограничение СУБД: r_max_db = ⌊(max_conn - conn_reserve) / pool_size⌋
         r_max_db = math.floor((max_conn - conn_reserve) / pool_size)
         self.r_max = min(r_max_cluster, r_max_db)
         logger.info(
@@ -108,7 +108,6 @@ class ResourceDecisionModule:
         Возвращает:
           DecisionResult с итоговым r_fin и описанием действия.
         """
-        # ── Шаг 1: r_req (формула 3.7) ────────────────────────────────────
         # q_upper — средняя утилизация по подам (доля от лимита одного пода).
         # Чтобы при изменении нагрузки удерживать среднюю утилизацию на cpu_target,
         # из условия r_cur · q_upper = r_req · cpu_target получаем:
@@ -126,11 +125,11 @@ class ResourceDecisionModule:
                 f"Setting r_bounded={r_bounded}."
             )
 
-        # ── Шаг 3: Адаптивный порог δ_t (формула 3.17) ───────────────────
+        # ── Шаг 3: Адаптивный порог δ_t ──────────────────────────────────
         ci_width = max(q_upper - q_lower, 0.0)
         delta_t = self.beta * ci_width / self.cpu_target
 
-        # ── Шаг 4: Механизм гистерезиса (формулы 3.16, 3.18) ─────────────
+        # ── Шаг 4: Механизм гистерезиса ──────────────────────────────────
         action = "no_change"
 
         if r_bounded > self._r_cur:
@@ -162,7 +161,7 @@ class ResourceDecisionModule:
             self._confirm_counter = 0
             action = "no_change"
 
-        # ── Шаг 5: r_fin (формула 3.18): max(r_min, r_dec) ───────────────
+        # ── Шаг 5: r_fin = max(r_min, r_dec) ─────────────────────────────
         r_fin = max(self.r_min, self._r_cur)
         if saturation:
             action = "saturated"

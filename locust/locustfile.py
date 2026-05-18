@@ -1,12 +1,12 @@
 """
-locust/locustfile.py — Сценарии генерации нагрузки (параграф 4.1, инструмент Locust 2.20)
+locust/locustfile.py — Сценарии генерации нагрузки (Locust 2.20).
 
 Три класса пользователей соответствуют трём функциональным классам запросов.
 
 ПОСТОЯННАЯ НАГРУЗКА:
   locust -f locustfile.py --headless -u 30 -r 5 --run-time 5m --host http://localhost:8080
 
-ПЕРЕМЕННАЯ НАГРУЗКА (суточный профиль, см. DailyDiurnalShape ниже):
+ПЕРЕМЕННАЯ НАГРУЗКА (суточный профиль):
   # 24 часа (естественная развёртка):
   locust -f locustfile.py --headless --host http://localhost:8080
 

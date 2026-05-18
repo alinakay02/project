@@ -1,5 +1,5 @@
 """
-scripts/run_all_tests.py — Запуск экспериментов главы 4.
+scripts/run_all_tests.py — Запуск всех экспериментов.
 
 Поддерживает три режима:
 
@@ -353,7 +353,7 @@ def run_parallel(append: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Запуск экспериментов главы 4 (сравнение методов прогнозирования).",
+        description="Запуск экспериментов по сравнению методов прогнозирования.",
     )
     parser.add_argument("--append", action="store_true",
                         help="Дописать к файлу результатов, не перезаписывать.")

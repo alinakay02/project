@@ -1,7 +1,7 @@
 """
-tests/baselines.py — Базовые методы сравнения (параграф 4.1)
-tests/data_generators.py — Генераторы синтетических данных (параграф 4.2)
-tests/metrics.py — Метрики оценки (параграф 4.2)
+tests/baselines.py — Базовые методы сравнения.
+tests/data_generators.py — Генераторы синтетических данных.
+tests/metrics.py — Метрики оценки.
 """
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -713,24 +713,21 @@ def load_azure_trace(
 # ════════════════════════════════════════════════════════════════════════════
 
 def compute_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """MAE (формула 4.1)."""
     return float(np.mean(np.abs(y_true - y_pred)))
 
 
 def compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """RMSE (формула 4.2)."""
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
 
 def compute_mape(y_true: np.ndarray, y_pred: np.ndarray, eps=1e-8) -> float:
-    """MAPE (формула 4.3)."""
     return float(np.mean(np.abs(y_true - y_pred) / (np.abs(y_true) + eps)) * 100)
 
 
 def compute_coverage(
     y_true: np.ndarray, q_lower: np.ndarray, q_upper: np.ndarray
 ) -> float:
-    """Покрытие ДИ 95% (параграф 4.2)."""
+    """Покрытие 95%-ДИ."""
     covered = np.sum((y_true >= q_lower) & (y_true <= q_upper))
     return 100.0 * covered / max(len(y_true), 1)
 
@@ -738,7 +735,7 @@ def compute_coverage(
 def compute_sla_violations(
     cpu_actual: np.ndarray, r_history: np.ndarray, cpu_target: float = 0.70
 ) -> float:
-    """Доля нарушений SLA (параграф 4.2)."""
+    """Доля нарушений SLA."""
     capacity = cpu_target * r_history
     violations = np.sum(cpu_actual > capacity)
     return 100.0 * violations / max(len(cpu_actual), 1)
@@ -747,13 +744,12 @@ def compute_sla_violations(
 def compute_avg_utilization(
     cpu_actual: np.ndarray, r_history: np.ndarray, cpu_target: float = 0.70
 ) -> float:
-    """Средняя утилизация (параграф 4.2)."""
+    """Средняя утилизация."""
     capacity = cpu_target * r_history + 1e-9
     return 100.0 * float(np.mean(cpu_actual / capacity))
 
 
 def compute_scale_ops(r_history: np.ndarray) -> int:
-    """Число операций масштабирования."""
     return int(np.sum(np.diff(r_history) != 0))
 
 
@@ -761,7 +757,6 @@ def print_forecast_metrics(
     test_name: str,
     maes: list, rmses: list, mapes: list, coverages: list
 ):
-    """Выводит строку метрик для копирования в таблицу."""
     print(
         f"\n[METRIC] ТЕСТ: {test_name} | "
         f"MAE={np.mean(maes):.4f}±{np.std(maes):.4f} | "
@@ -772,7 +767,6 @@ def print_forecast_metrics(
 
 
 def print_mgmt_metrics(test_name: str, sla: list, util: list, ops: list):
-    """Выводит строку метрик управления для таблицы."""
     print(
         f"\n[METRIC] MGMT ТЕСТ: {test_name} | "
         f"SLA_VIOLATIONS={np.mean(sla):.2f}%±{np.std(sla):.2f}% | "

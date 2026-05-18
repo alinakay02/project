@@ -1,8 +1,8 @@
 """
-predictor/forecaster.py — Гибридная модель прогнозирования (параграф 3.2.2).
+predictor/forecaster.py — Гибридная модель прогнозирования.
 
 Состав метода:
-  1. STL-декомпозиция  cpu_t = T_t + S_t + R_t (см. preprocessor.py) и
+  1. STL-декомпозиция  cpu_t = T_t + S_t + R_t и
      аналитический наивный прогноз
          h_naive(t+k) = T̂(k) + Ŝ(phase(t+k)).
      T̂ — линейная экстраполяция тренда по последним p точкам, Ŝ —
@@ -52,7 +52,7 @@ class HybridForecaster:
     Гибридный прогнозатор (STL-наивный анкер + GRU-поправка).
 
     Параметры:
-      preprocessor : экземпляр Preprocessor (см. predictor/preprocessor.py)
+      preprocessor : экземпляр Preprocessor
       n_T          : глубина окна для экстраполяции тренда (в Preprocessor)
       n_cycles     : сохранён для совместимости конфига (не используется)
       period       : суточный период (для совместимости)
@@ -98,7 +98,6 @@ class HybridForecaster:
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
 
-        # Анкер residual_idx=0 — главный канал (cpu_norm, z-score сырого ряда).
         # Целевая переменная сети — cpu_norm[t+k]. Head предсказывает
         # cpu_norm[t+k] − cpu_norm[t−1] = первые разности в z-score шкале.
         # Это «бесплатный» AR(1)-приор в той же шкале, что и цель.
@@ -132,7 +131,7 @@ class HybridForecaster:
         # Конформная калибровка (per-step 95%-ДИ).
         self.conformal_widths: np.ndarray = np.zeros(self.horizon_h, dtype=np.float32)
         self.epsilon: float = 1.0 - (max(self.quantiles) - min(self.quantiles))
-        # α ∈ [0, 1]: взвешивание GRU-коррекции (см. _calibrate_conformal).
+        # α ∈ [0, 1]: взвешивание GRU-коррекции.
         # α=1 — полное доверие к GRU, α=0 — чистый наивный прогноз.
         self.blend_alpha: float = 1.0
 
@@ -174,7 +173,6 @@ class HybridForecaster:
 
         mu_cpu = float(self.preprocessor.mu_cpu)
         sigma_cpu = float(self.preprocessor.sigma_cpu)
-        # Главный канал GRU = z-score(СЫРОГО) ряда.
         cpu_norm = ((cpu_series - mu_cpu) / sigma_cpu).astype(np.float32)
 
         self._cpu_train = cpu_series.copy()
@@ -188,9 +186,6 @@ class HybridForecaster:
         if n_tr <= self.w_input + self.horizon_h:
             raise ValueError(f"Train portion too small after val_split: n_tr={n_tr}")
 
-        # Датасет: цель = cpu_norm (z-score сырого ряда), главный канал =
-        # cpu_norm (для AR(1)-анкера по residual_idx=0), extra = resid_norm
-        # (контекст стационарного STL-остатка как доп. признак).
         train_ds = TimeSeriesDataset(
             target=cpu_norm[:n_tr],
             timestamps=timestamps[:n_tr],
@@ -232,7 +227,6 @@ class HybridForecaster:
         """
         Дообучение (fine-tuning) на скользящем окне.
 
-        Разделяет «долгосрочные» и «краткосрочные» компоненты модели:
           • Preprocessor-статистики (μ_cpu, σ_cpu, σ_R, сезонный профиль,
             параметры тренда) — СОХРАНЯЮТСЯ от initial fit, выполненного
             на большой выборке (десятки суток). Это стабильнее, чем их
@@ -242,9 +236,6 @@ class HybridForecaster:
             к недавней динамике, не разрушая долгосрочные паттерны.
           • blend_alpha и conformal_widths — перекалибруются на свежем
             окне (они отражают _недавнее_ соотношение сигнала и ошибки).
-
-        Такое разделение предотвращает деградацию качества при retrain,
-        наблюдавшуюся при полном переобучении (параграф 4.3 диссертации).
         """
         cpu_series = np.asarray(cpu_series, dtype=np.float32)
         timestamps = np.asarray(timestamps, dtype=np.int64)
@@ -366,8 +357,6 @@ class HybridForecaster:
             stride = max(1, len(anchors) // 512)
             anchors = anchors[::stride]
 
-        # Векторизованное построение батча признаков. Главный канал (индекс 0) —
-        # cpu_norm (цель обучения); вспомогательный (индекс 1) — resid_norm.
         batch_X: List[np.ndarray] = []
         naive_anchors: List[np.ndarray] = []   # (B, h) — наивный прогноз на каждом шаге
         for t in anchors:
@@ -531,8 +520,6 @@ class HybridForecaster:
         sigma_cpu = float(self.preprocessor.sigma_cpu)
         cpu_norm_tail = ((cpu_tail - mu_cpu) / sigma_cpu).astype(np.float32)
 
-        # Признаки последнего окна: главный канал = cpu_norm (цель сети),
-        # extra = resid_norm (STL-остаток как контекст).
         X = self._stack_features(
             cpu_norm_tail[-w:], resid_norm[-w:], ts_tail[-w:]
         )

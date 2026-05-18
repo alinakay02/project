@@ -39,13 +39,13 @@ agg = df.groupby("bucket").agg(
 agg.columns = ["timestamp", "cpu_avg", "cpu_max"]
 agg = agg.sort_values("timestamp").reset_index(drop=True)
 
-# Нормализуем: cpu_avg ∈ [0, 1] (формула 3.1)
+# Нормализуем: cpu_avg ∈ [0, 1]
 if agg["cpu_avg"].max() > 1.5:
     # Если значения > 1.5, это абсолютное использование (нужно нормировать)
     agg["cpu_avg"] = agg["cpu_avg"] / 100.0
 agg["cpu_avg"] = agg["cpu_avg"].clip(0.01, 0.99)
 
-# Оставляем 2304 наблюдения = 8 суток (параграф 4.2)
+# Оставляем 2304 наблюдения = 8 суток
 agg = agg.head(2304)
 
 agg[["timestamp", "cpu_avg"]].to_csv(OUT, index=False)

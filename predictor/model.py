@@ -1,19 +1,12 @@
 """
 predictor/model.py — Нейросетевая компонента: прямой многошаговый квантильный GRU.
 
-Архитектура (параграф 3.2.2 диссертации, обновлённая редакция):
+Архитектура:
   Вход : последовательность w_input шагов, каждый шаг = 7 признаков
          [r̃_t, sin h, cos h, sin d, cos d, sin m, cos m]
   Тело : 2 слоя GRU(hidden_dim) с межслойным dropout
   Голова: Linear(hidden_dim → 64) + ReLU + Dropout + Linear(64 → n_quantiles*horizon_h)
   Выход: тензор формы (batch, horizon_h, n_quantiles).
-
-Ключевые отличия от старой версии:
-  • прямой многошаговый прогноз (direct multi-step) — h значений за один forward,
-    а не повторение одного и того же 1-шагового предсказания h раз;
-  • квантильная (pinball) функция потерь усреднена по h*n_q выходам;
-  • явное использование CUDA, если доступна; ранняя остановка работает (patience > 0);
-  • DataLoader использует pin_memory + num_workers=0 на Windows для стабильности.
 """
 
 from __future__ import annotations
@@ -153,7 +146,7 @@ class TimeSeriesDataset(Dataset):
 
     def __init__(
         self,
-        target: np.ndarray,                # цель и одновременно главный сигнальный канал
+        target: np.ndarray,
         timestamps: np.ndarray,
         phi: Optional[np.ndarray] = None,  # сохранён для совместимости, не используется
         w_input: int = 60,

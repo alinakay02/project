@@ -1,5 +1,5 @@
 """
-tests/test_table_4_9.py — Таблица 4.9: Влияние календарных признаков
+tests/test_table_4_9.py — Влияние календарных признаков
 на точность прогноза на синтетическом «Стационарном» наборе данных.
 
 Сравнивает две конфигурации:
@@ -266,7 +266,7 @@ def _eval_config(with_calendar: bool, seed: int, cpu, ts, phi):
 
 
 class TestTable49:
-    """Таблица 4.9: с календарными признаками vs без них (Стационарный синт.)."""
+    """С календарными признаками vs без них (Стационарный синт.)."""
 
     def test_calendar_features(self):
         cpu, ts, phi = generate_stationary(N_OBS_SYNTHETIC, seed=42)

@@ -1,5 +1,5 @@
 """
-controller/prometheus_collector.py — Сбор метрик из Prometheus (параграф 3.2.1)
+controller/prometheus_collector.py — Сбор метрик из Prometheus.
 
 Формирует вектор m_t = (cpu_t, mem_t, rps_t, lat_t, err_t) и вектор φ_t
 посредством PromQL-запросов, описанных в config.yaml.
@@ -80,14 +80,12 @@ class PrometheusCollector:
         lat    = self._query(self.queries["lat_p95"]) or 0.0
         err    = self._query(self.queries["err_rate"]) or 0.0
 
-        # Ограничиваем cpu и mem в [0, 1]
         cpu = float(np.clip(cpu, 0.0, 2.0))   # может временно превышать 1.0 при throttling
         mem = float(np.clip(mem, 0.0, 1.5))
         err = float(np.clip(err, 0.0, 1.0))
 
         m_t = np.array([cpu, mem, rps, lat, err], dtype=np.float32)
 
-        # Состав классов (формула 3.2)
         class_rates = self._query_vector(self.queries["class_counts"])
         c1 = class_rates.get("1", 0.0)
         c2 = class_rates.get("2", 0.0)

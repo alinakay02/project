@@ -1,5 +1,5 @@
 """
-controller/control_loop.py — Основной управляющий цикл (параграф 3.3, рис. 3.2)
+controller/control_loop.py — Основной управляющий цикл.
 
 Итерация каждые Δt=5 мин:
   1. Сбор m_t, φ_t из Prometheus
@@ -49,15 +49,15 @@ FORECAST_CPU_UPPER = Gauge(
 )
 DECISION_R_REQ = Gauge(
     "controller_decision_r_req",
-    "Требуемое число реплик по формуле 3.7 (до применения r_max)",
+    "Требуемое число реплик (до применения r_max)",
 )
 DECISION_R_FIN = Gauge(
     "controller_decision_r_fin",
-    "Итоговое решение о числе реплик (формула 3.18, после гистерезиса)",
+    "Итоговое решение о числе реплик (после гистерезиса)",
 )
 DECISION_DELTA_T = Gauge(
     "controller_decision_delta_t",
-    "Адаптивный порог гистерезиса δ_t (формула 3.17)",
+    "Адаптивный порог гистерезиса δ_t",
 )
 DECISION_SATURATION = Gauge(
     "controller_decision_saturation",
@@ -77,7 +77,6 @@ class ControlLoop:
     """
     Замкнутый цикл управления нагрузкой.
 
-    Реализует алгоритм рис. 3.2:
       - Буфер наблюдений: скользящее окно retrain_window=2016 точек
       - Дообучение: каждые retrain_every=60 итераций
     """
@@ -193,7 +192,7 @@ class ControlLoop:
 
     def run(self, initial_data: Optional[Dict] = None) -> None:
         """
-        Бесконечный управляющий цикл (рис. 3.2).
+        Бесконечный управляющий цикл.
         initial_data: можно передать исторические данные для начального обучения.
         """
         logger.info("Control loop starting.")
@@ -218,7 +217,7 @@ class ControlLoop:
             time.sleep(sleep_time)
 
     def _step(self) -> Optional[DecisionResult]:
-        """Одна итерация управляющего цикла (рис. 3.2)."""
+        """Одна итерация управляющего цикла."""
         now_ts = int(time.time())
 
         # ── 1. Сбор метрик ───────────────────────────────────────────────
@@ -322,7 +321,7 @@ class ControlLoop:
 
     def _reactive_hpa(self, cpu_t: float) -> DecisionResult:
         """
-        Fallback: реактивный HPA (стандартная формула Kubernetes).
+        Fallback: реактивный HPA по стандартной схеме Kubernetes.
         r = ceil(r_cur * cpu_t / cpu_target)
         """
         r_cur = self.decision_module.current_replicas

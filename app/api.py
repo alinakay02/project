@@ -1,5 +1,5 @@
 """
-app/api.py — REST API для веб-интерфейса экспериментального стенда (параграф 4.1)
+app/api.py — REST API для веб-интерфейса экспериментального стенда.
 
 Режимы работы:
   • real — подключение к Prometheus и Kubernetes API. Поллер каждые 5 секунд
@@ -82,9 +82,9 @@ _config_lock = threading.Lock()
 
 def _real_forecast(history_values, horizon_h, period=288, n_T=60, n_cycles=7):
     """
-    Прогноз по реальному алгоритму проекта (параграф 3.2.2):
-      - Тренд: линейная экстраполяция МНК (формула 3.11)
-      - Сезонность: усреднение по N_c предыдущим суточным циклам (формула 3.12)
+    Прогноз по реальному алгоритму проекта:
+      - Тренд: линейная экстраполяция МНК
+      - Сезонность: усреднение по N_c предыдущим суточным циклам
       - ДИ: на основе дисперсии остатка, расширяется с горизонтом
     """
     arr = np.array(history_values, dtype=float)
@@ -109,7 +109,7 @@ def _real_forecast(history_values, horizon_h, period=288, n_T=60, n_cycles=7):
     # ── Сезонная компонента (отклонения от тренда) ─────────────────────
     detrended = arr - trend
 
-    # ── Прогноз тренда: линейная экстраполяция (формула 3.11) ──────────
+    # ── Прогноз тренда: линейная экстраполяция ─────────────────────────
     trend_tail = trend[-min(n_T, n):]
     idx = np.arange(len(trend_tail))
     slope, intercept, _, _, _ = linregress(idx, trend_tail)
@@ -124,7 +124,7 @@ def _real_forecast(history_values, horizon_h, period=288, n_T=60, n_cycles=7):
         # T̂_{t+k}: экстраполяция линейного тренда
         t_hat = slope * (len(trend_tail) + k - 1) + intercept
 
-        # Ŝ_{t+k}: среднее из предыдущих суточных циклов (формула 3.12)
+        # Ŝ_{t+k}: среднее из предыдущих суточных циклов
         s_hat = 0.0
         season_vals = []
         for j in range(1, n_cycles + 1):

@@ -1,5 +1,5 @@
 """
-tests/test_table_4_7.py — Таблица 4.7: Зависимость MAE от горизонта
+tests/test_table_4_7.py — Зависимость MAE от горизонта
 прогнозирования на наборе Alibaba Cluster Trace 2018.
 
 Прогоняет 3 метода (Разработанный, автономная GRU, SARIMA) на горизонтах
@@ -93,7 +93,7 @@ def _make_forecaster(method_name: str, seed: int, horizon_h: int):
 @pytest.mark.parametrize("method_name", ["proposed", "gru", "sarima"])
 @pytest.mark.parametrize("h", HORIZONS)
 class TestTable47:
-    """Таблица 4.7: MAE × (метод, горизонт)."""
+    """MAE × (метод, горизонт)."""
 
     def test_horizon(self, method_name, h):
         cpu, ts, phi = load_alibaba_trace()
