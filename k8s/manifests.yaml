@@ -215,6 +215,11 @@ spec:
           env:
             - name: PYTHONPATH
               value: "/app"
+            # Куда внутренний load-runner шлёт запросы. По имени Service
+            # они проходят через kube-proxy и распределяются между ВСЕМИ
+            # репликами webapp — иначе CPU поднимался бы только в одном поде.
+            - name: LOAD_TARGET_URL
+              value: "http://webapp.default.svc:80"
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml
@@ -245,6 +250,14 @@ spec:
 ---
 # Webapp API — Service (NodePort: доступен с хоста по http://localhost:30051
 # через extraPortMappings в kind-config.yaml)
+#
+# sessionAffinity: ClientIP — критично! Состояние обучения и нагрузочного
+# генератора хранится в памяти api.py поштучно в каждом поде. Без affinity
+# kube-proxy раскидывает запросы между репликами round-robin, и UI «мигает»:
+# например, кнопка обучения чередует «Запустить обучение» и «Обучение...»,
+# потому что один под отвечает с running=true, другой — с running=false.
+# С ClientIP клиент всегда попадает на один и тот же под (на 3 часа), и
+# состояние сессии консистентно.
 apiVersion: v1
 kind: Service
 metadata:
@@ -254,6 +267,10 @@ spec:
   type: NodePort
   selector:
     app: webapp
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   ports:
     - port: 5001
       targetPort: 5001

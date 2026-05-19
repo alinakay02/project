@@ -12,7 +12,7 @@
     <!-- ── Верхняя строка метрик ────────────────────────────────────────── -->
     <div class="grid-5">
       <div class="card metric-card">
-        <div class="metric-label">CPU утилизация</div>
+        <div class="metric-label">CPU</div>
         <div class="metric-value" :style="{ color: cpuColor }">
           {{ pct(status.metrics.cpu_t) }}
         </div>

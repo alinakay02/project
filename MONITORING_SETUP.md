@@ -304,6 +304,9 @@ kubectl get deployment webapp -w
 kubectl get nodes
 # Все 6 нод должны быть Ready (через 1-2 минуты после старта Docker).
 
+# если тут ошибка было, то надо выполнить: 
+#docker restart webapp-cluster-control-plane webapp-cluster-worker webapp-cluster-worker2 webapp-cluster-worker3
+
 # 3. Проверьте поды
 kubectl get pods
 # Все должны стать Running через 1-3 минуты. Если какой-то застрял
@@ -344,6 +347,7 @@ kubectl rollout restart deployment/controller
 docker build -f Dockerfile.webapp -t webapp:latest .
 kind load docker-image webapp:latest --name webapp-cluster
 kubectl rollout restart deployment/webapp
+kubectl rollout status deployment/webapp
 
 # Если меняли только манифесты k8s/:
 kubectl apply -f k8s/manifests.yaml

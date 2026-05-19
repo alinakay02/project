@@ -13,6 +13,13 @@ COPY config.yaml .
 COPY app/ ./app/
 COPY predictor/ ./predictor/
 COPY controller/ ./controller/
+# Датасеты — нужны для /api/datasets/preview и /api/training/start (загрузка CSV)
+COPY data/ ./data/
+# Тесты и скрипт-обёртка — нужны для /api/experiments/run (кнопка
+# «Запустить тесты» на странице Сравнение). scripts/save_results.py запускает
+# pytest tests/test_experiments.py и сохраняет [METRIC]-строки в БД.
+COPY tests/ ./tests/
+COPY scripts/ ./scripts/
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

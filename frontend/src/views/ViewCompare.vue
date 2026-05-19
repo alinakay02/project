@@ -1,28 +1,55 @@
 <template>
   <div>
     <div class="page-header">
-      <h2 class="page-title">Сравнение методов и анализ абляции</h2>
+      <h2 class="page-title">Сравнение методов прогнозирования</h2>
     </div>
 
     <!-- Панель управления -->
     <div class="toolbar mt-4">
       <label>Набор данных:</label>
-      <select v-model="selectedDataset" @change="loadComparison">
+      <select v-model="selectedDataset" @change="loadAll">
         <option v-for="d in datasets" :key="d.id" :value="d.id">
           {{ d.name }}
         </option>
       </select>
-      <button class="btn btn-primary" :disabled="runStatus === 'running'" @click="triggerRun('')">
-        {{ runStatus === 'running' ? 'Тесты выполняются...' : 'Запустить все тесты' }}
-      </button>
-      <button class="btn btn-ghost" :disabled="runStatus === 'running'" @click="triggerRun('TestComputationTime')">
-        Только время
-      </button>
-      <button class="btn btn-ghost" :disabled="runStatus === 'running'" @click="triggerRun('TestAblation')">
-        Только абляция
+      <button class="btn btn-ghost" @click="loadAll" :disabled="runStatus === 'running'">
+        Обновить
       </button>
       <span v-if="dataSource === 'db'" class="badge badge-green">данные из БД</span>
-      <span v-else-if="dataSource === 'empty'" class="badge badge-orange">нет данных — запустите тесты</span>
+      <span v-else-if="dataSource === 'default'" class="badge badge-blue">эталонные значения</span>
+    </div>
+
+    <!-- Запуск реальных тестов -->
+    <div class="card mt-4">
+      <div class="toolbar">
+        <button class="btn btn-primary"
+                :disabled="runStatus === 'running'"
+                @click="triggerRun('TestCompareAlibaba')">
+          {{ runStatus === 'running' ? 'Тесты выполняются…' : 'Сравнение на Alibaba' }}
+        </button>
+        <button class="btn btn-ghost"
+                :disabled="runStatus === 'running'"
+                @click="triggerRun('TestComputationTime')">
+          Только время итерации
+        </button>
+        <button class="btn btn-ghost"
+                :disabled="runStatus === 'running'"
+                @click="triggerRun('TestHorizonDependence')">
+          Зависимость от горизонта
+        </button>
+        <button class="btn btn-ghost"
+                :disabled="runStatus === 'running'"
+                @click="triggerRun('')">
+          Все тесты
+        </button>
+        <span v-if="runInfo.started_at" class="badge badge-gray">
+          старт: {{ runInfo.started_at }}<span v-if="runInfo.filter"> · фильтр: {{ runInfo.filter }}</span>
+        </span>
+        <span v-if="runStatus === 'running'" class="badge badge-orange">выполняется…</span>
+        <span v-else-if="runStatus === 'done'" class="badge badge-green">
+          готово · записей: {{ runInfo.count ?? '—' }}
+        </span>
+      </div>
     </div>
 
     <!-- ── Таблица сравнения методов ─────────────────────────────────────── -->
@@ -40,7 +67,7 @@
               <th class="num">MAPE, %</th>
               <th class="num">Покрытие ДИ, %</th>
               <th class="num">Нарушения SLA, %</th>
-              <th class="num">Средняя утилизация, %</th>
+              <th class="num">Средний CPU, %</th>
               <th class="num">Операции масштабирования</th>
             </tr>
           </thead>
@@ -86,9 +113,9 @@
         </div>
       </div>
 
-      <!-- ── Scatter: нарушения SLA vs утилизация ──────────────────────────  -->
+      <!-- ── Scatter: нарушения SLA vs CPU ──────────────────────────  -->
       <div class="card">
-        <div class="card-title">Нарушения SLA и утилизация</div>
+        <div class="card-title">Нарушения SLA и CPU</div>
         <div class="chart-wrap">
           <ScatterChart :data="scatterData" :options="scatterOptions" />
         </div>
@@ -111,34 +138,6 @@
             <td><strong>{{ row.h }} ({{ row.h*5 }} мин)</strong></td>
             <td class="num" style="color:#276749">{{ fmt(row.mae, 4) }}</td>
             <td class="num" style="color:#718096">{{ fmt(row.mae_std, 4) }}</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <!-- ── Анализ абляции ─────────────────────────────────────────────────── -->
-    <div class="card mt-4" v-if="ablation.length">
-      <div class="card-title">Анализ вклада компонентов метода</div>
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Конфигурация</th>
-            <th class="num">MAE</th>
-            <th class="num">Детали</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(row, i) in ablation" :key="row.config" :class="{ best: i === 0 }">
-            <td>
-              <span v-if="i === 0" class="badge badge-green">*</span>
-              {{ row.config }}
-            </td>
-            <td class="num" :style="{ color: i===0 ? '#276749' : '' }">
-              {{ fmt(row.mae, 3) }}
-            </td>
-            <td class="num" style="font-size:11px;color:#718096">
-              {{ ablationDetails(row) }}
-            </td>
           </tr>
         </tbody>
       </table>
@@ -233,7 +232,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import {
   Chart as ChartJS, CategoryScale, LinearScale, BarElement,
@@ -245,27 +244,21 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, PointElement, LineEleme
 const selectedDataset = ref('alibaba')
 const datasets     = ref([])
 const comparison   = ref([])
-const ablation     = ref([])
 const horizonRows  = ref([])
 const phiRows      = ref([])
 const timeRows     = ref([])
 const spikeRows    = ref([])
 const retrainRows  = ref([])
-const runStatus    = ref('idle')
 const dataSource   = ref('')
+
+// Состояние запущенного pytest-прогона: 'idle' | 'running' | 'done'
+const runStatus = ref('idle')
+const runInfo   = ref({ started_at: null, filter: '', count: null })
+let runPoll = null
 
 const fmt = (v, d) => v != null ? Number(v).toFixed(d) : '—'
 const slaColor  = v => v > 5 ? '#e53e3e' : v > 3 ? '#dd6b20' : '#276749'
 const coverageBadge = v => v >= 93 && v <= 97 ? 'badge badge-green' : 'badge badge-orange'
-
-function ablationDetails(row) {
-  const m = row.metrics || {}
-  if (m.worsening_pct) return `Ухудшение MAE: +${Number(m.worsening_pct).toFixed(1)}%`
-  if (m.sla_without) return `SLA: ${m.sla_with}% → ${m.sla_without}%`
-  if (m.scale_ops_without) return `Ops: ${m.scale_ops_with} → ${m.scale_ops_without}`
-  if (m.util_fixed) return `Util: ${m.util_adaptive}% → ${m.util_fixed}%`
-  return ''
-}
 
 const methodColors = ['#38a169','#3182ce','#805ad5','#dd6b20','#e53e3e','#718096']
 
@@ -306,7 +299,7 @@ const scatterOptions = {
     x: { ticks: { color:'#4a5568', callback: v => v+'%' }, grid: { color:'#edf2f7' },
          title: { display:true, text:'Нарушения SLA, %', color:'#4a5568' }, min:0 },
     y: { ticks: { color:'#4a5568', callback: v => v+'%' }, grid: { color:'#edf2f7' },
-         title: { display:true, text:'Средняя утилизация, %', color:'#4a5568' } }
+         title: { display:true, text:'Средний CPU, %', color:'#4a5568' } }
   },
   plugins: { legend: { labels: { color:'#4a5568', font:{size:10} } } }
 }
@@ -316,13 +309,6 @@ async function loadComparison() {
     const { data } = await axios.get(`/api/compare?dataset=${selectedDataset.value}`)
     comparison.value = data.results || []
     dataSource.value = data.source || ''
-  } catch {}
-}
-
-async function loadAblation() {
-  try {
-    const { data } = await axios.get('/api/ablation')
-    ablation.value = data.results || []
   } catch {}
 }
 
@@ -362,28 +348,8 @@ async function loadRetrain() {
 }
 
 function loadAll() {
-  loadComparison(); loadAblation(); loadHorizon()
+  loadComparison(); loadHorizon()
   loadPhi(); loadTiming(); loadSpike(); loadRetrain()
-}
-
-async function triggerRun(filter) {
-  runStatus.value = 'running'
-  try {
-    await axios.post('/api/experiments/run', { filter })
-    // Поллинг статуса
-    const poll = setInterval(async () => {
-      try {
-        const { data } = await axios.get('/api/experiments/status')
-        if (!data.running) {
-          clearInterval(poll)
-          runStatus.value = 'done'
-          loadAll()  // Обновляем все данные
-        }
-      } catch {}
-    }, 5000)
-  } catch {
-    runStatus.value = 'idle'
-  }
 }
 
 async function fetchDatasets() {
@@ -393,7 +359,50 @@ async function fetchDatasets() {
   } catch {}
 }
 
-onMounted(() => { fetchDatasets(); loadAll() })
+async function checkRunStatus() {
+  try {
+    const { data } = await axios.get('/api/experiments/status')
+    if (data.started_at) {
+      runInfo.value = {
+        started_at: data.started_at,
+        filter:     data.filter || '',
+        count:      data.count,
+      }
+    }
+    if (data.running) {
+      runStatus.value = 'running'
+    } else if (runStatus.value === 'running') {
+      // прогон завершился — обновим все таблицы
+      runStatus.value = 'done'
+      runInfo.value.count = data.count
+      loadAll()
+    }
+  } catch {}
+}
+
+async function triggerRun(filter) {
+  // Защита от повторного нажатия
+  if (runStatus.value === 'running') return
+  try {
+    await axios.post('/api/experiments/run', { filter })
+    runStatus.value = 'running'
+    runInfo.value = { started_at: new Date().toLocaleTimeString('ru-RU'),
+                      filter, count: null }
+    // Поллим статус каждые 5 секунд
+    if (runPoll) clearInterval(runPoll)
+    runPoll = setInterval(checkRunStatus, 5000)
+  } catch (e) {
+    runStatus.value = 'idle'
+  }
+}
+
+onMounted(() => {
+  fetchDatasets()
+  loadAll()
+  // Подхватываем «висящий» прогон, если страница перезагружена во время теста
+  checkRunStatus()
+})
+onUnmounted(() => { if (runPoll) clearInterval(runPoll) })
 </script>
 
 <style scoped>

@@ -125,7 +125,7 @@
           <div class="card-title">Фактические метрики системы</div>
           <div class="live-metrics">
             <div class="lm-row">
-              <span class="lm-k">CPU утилизация</span>
+              <span class="lm-k">CPU</span>
               <span class="lm-v" :style="{ color: liveMetrics.cpu_t > config.cpu_target ? '#dd6b20' : '#276749' }">
                 {{ (liveMetrics.cpu_t * 100).toFixed(1) }}%
               </span>

@@ -35,9 +35,13 @@
               <div class="progress-fill" :style="{ width: epochPct + '%' }"></div>
             </div>
           </div>
-          <div v-if="!training.running && training.epoch > 0" class="result-box mt-4">
+          <div v-if="!training.running && training.epoch > 0 && !training.error" class="result-box mt-4">
             <span class="badge badge-green">Обучение завершено</span>
             val_loss = {{ training.best_val?.toFixed(4) || '—' }}
+          </div>
+          <div v-if="training.error" class="error-box mt-4">
+            <span class="badge badge-red">Ошибка обучения</span>
+            <div style="margin-top:6px;font-size:12px;color:#742a2a">{{ training.error }}</div>
           </div>
         </div>
       </div>
@@ -148,7 +152,7 @@ const fmtTime = ts => {
 const previewChartData = computed(() => ({
   labels: previewTs.value.map((ts, i) => i % Math.max(1, Math.floor(previewTs.value.length / 12)) === 0 ? fmtTime(ts) : ''),
   datasets: [{
-    label: 'CPU утилизация',
+    label: 'CPU',
     data: previewCpu.value.map(v => +(v * 100).toFixed(1)),
     borderColor: '#3182ce', borderWidth: 1.5,
     pointRadius: 0, fill: false, tension: .2,
@@ -207,6 +211,8 @@ onUnmounted(() => clearInterval(timer))
 
 .result-box { background: #f0fff4; border: 1px solid #c6f6d5; border-radius: 6px; padding: 10px 12px;
               font-size: 13px; color: #276749 }
+.error-box  { background: #fff5f5; border: 1px solid #feb2b2; border-radius: 6px; padding: 10px 12px;
+              font-size: 13px; color: #742a2a }
 
 .chart-wrap { position: relative; height: 45vh; max-height: 400px }
 

@@ -10,3 +10,9 @@ pandas==2.2.2
 statsmodels==0.14.2
 torch==2.1.2
 kubernetes==28.1.0
+# Для запуска /api/experiments/run внутри webapp-контейнера: pytest
+# дёргается из scripts/save_results.py, scikit-learn нужен для
+# RandomForestForecaster из tests/baselines.py.
+pytest==8.3.2
+pytest-html==4.1.1
+scikit-learn==1.5.1
