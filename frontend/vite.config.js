@@ -12,7 +12,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:5001',
+        target: 'http://127.0.0.1:5001',
         changeOrigin: true,
         // SSE (/api/stream) — долгоживущее соединение. Отключаем WS-upgrade
         // и любые таймауты, чтобы proxy не рвал поток событий.
